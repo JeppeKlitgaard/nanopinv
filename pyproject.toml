@@ -1,0 +1,52 @@
+[project]
+name = "nanopinv"
+version = "0.1.0"
+description = "Tiny, educational implementation of probabilistic inversion in geophysics."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beartype>=0.22.9",
+    "equinox>=0.13.6",
+    "gstools>=1.7.0",
+    "jax>=0.9.2",
+    "jaxtyping>=0.3.9",
+    "joblib>=1.5.3",
+    "line-profiler>=5.0.2",
+    "numba>=0.64.0",
+    "numexpr>=2.14.1",
+    "numpy>=2",
+    "penzai>=0.2.5",
+    "polars>=1.39.3",
+    "scikit-fmm>=2025.6.23",
+    "scipy>=1.17",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel<7",
+    "pandas>=3.0.1",
+    "pip>=26.0.1",
+    "ruff>=0.15.8",
+]
+viz = [
+    "matplotlib>=3.10.8",
+    "seaborn>=0.13.2",
+    "tqdm>=4.67.3",
+    "jax-tqdm>=0.4.0",
+    "imageio-ffmpeg>=0.6.0",
+    "ipywidgets>=8.1.8",
+    "statsmodels>=0.14.6",
+]
+
+[tool.ruff]
+lint.extend-select = ["I"]
+lint.ignore = [
+    "F722",  # Ignore forward reference parse error, ruff does not support jaxtyping yet, see: https://github.com/astral-sh/ruff/issues/9860
+]
+
+[build-system]
+requires = ["uv_build>=0.11.1,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
