@@ -37,6 +37,12 @@ viz = [
     "ipywidgets>=8.1.8",
     "statsmodels>=0.14.6",
 ]
+cpu = [
+    "jax>=0.10.0",
+]
+gpu = [
+    "jax[cuda13]>=0.10.0",
+]
 
 [tool.ruff]
 lint.extend-select = ["I"]

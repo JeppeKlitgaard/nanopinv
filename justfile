@@ -1,5 +1,8 @@
-install:
-    uv sync --all-groups
+install-cpu:
+    uv sync --all-groups --no-group gpu
+
+install-gpu:
+    uv sync --all-groups --no-group cpu
 
 format:
     uv run ruff check --select I --fix .
