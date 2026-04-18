@@ -97,7 +97,7 @@ def travel_time_points(
     return receiver_travel_times
 
 
-def build_time_travel_points(
+def build_travel_time_points(
     sources, receivers, *grid_axes, order: int = 2, window: int = 1
 ):
     """
