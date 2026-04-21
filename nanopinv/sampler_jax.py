@@ -1,12 +1,16 @@
+import math
 from collections.abc import Callable
-from copy import deepcopy
 from functools import partial
 from typing import Any, Literal
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
+from einops import rearrange, reduce, repeat
 from jax_tqdm import PBar, scan_tqdm
+from statsmodels.tsa.stattools import acf
 
 from nanopinv._typing import Array, Bool, Float, Int, Key, Shaped
 from nanopinv.distribution import DistributionBase
@@ -56,12 +60,399 @@ class IterationState(eqx.Module):
     log_likelihood: Float[Array, ""]
 
 
-def initialize_betas(n_chains: int, base: float = 1.2) -> Float[Array, "n_chains"]:
-    exponents = -jnp.arange(n_chains - 1)
-    beta_decay = jnp.power(base, exponents)
-    betas = jnp.append(beta_decay, 0.0)
+def initialize_betas(
+    n_chains: int, base: float = 1.2, last_is_zero: bool = True
+) -> Float[Array, "n_chains"]:
+    exponents = -jnp.arange(n_chains)
+    betas = jnp.power(base, exponents)
+
+    if last_is_zero:
+        return jnp.append(betas[:-1], 0.0)
 
     return betas
+
+
+def take_first(tensor, axis):
+    # Sort in reverse to prevent axis shifting as dimensions are dropped
+    for ax in sorted(axis, reverse=True):
+        tensor = jnp.take(tensor, 0, axis=ax)
+
+    return tensor
+
+
+class History(eqx.Module):
+    # Iteration numbers for n_saved axis
+    iterations: Int[Array, "*batch n_saved"]
+
+    # Saved states for n_saved axis
+    states: IterationState  # Ensembled ["n_chains", "n_saved"]
+
+    # Whether the saved state was accepted for n_saved axis for each chain
+    states_accepted: Bool[Array, "n_saved n_chains"]
+    # Number of accepted proposals in the keep_interval for n_saved axis for each chain
+    iterand_n_accepted: Int[Array, "n_saved n_chains"]
+
+    # Swaps: None if not using parallel tempering
+    # Whether the swap was accepted for n_saved axis for each adjacent pair of chains
+    states_swap_accepted: Bool[Array, "n_saved n_chains-1"] | None
+    # Number of accepted swaps in the keep_interval for n_saved axis for each adjacent pair of chains
+    iterand_n_swap_accepted: Int[Array, "n_saved n_chains-1"] | None
+
+    # Temperatures (betas) and step sizes
+    # Either 0-d for single chain, 1-d for multiple chains, 2-d for multiple chains with tuning history
+    betas: (
+        Float[Array, ""] | Float[Array, "n_chains"] | Float[Array, "n_saved n_chains"]
+    )
+    step_sizes: (
+        Float[Array, ""] | Float[Array, "n_chains"] | Float[Array, "n_saved n_chains"]
+    )
+
+    # Whether these were varied (i.e. tuned)
+    varying_step_sizes: bool
+    varying_betas: bool
+
+    @property
+    def n_chains_flat(self) -> int:
+        """Returns the 'flat' number of chains, i.e. the total number of chains across all batches."""
+        return self.get_flat_shape()[0]
+
+    @property
+    def n_saved(self) -> int:
+        return self.get_flat_shape()[1]
+
+    def get_shapes(self) -> tuple[list[int], int, int]:
+        """Returns the shapes of the batch dimensions, n_chains, and n_saved."""
+        *batch_shape, n_chains, n_saved = self.states.log_likelihood.shape
+        return batch_shape, n_chains, n_saved
+
+    def get_flat_shape(self) -> tuple[int, int]:
+        """Returns the shape (n_chains_flat, n_saved)"""
+        batch_shape, n_chains, n_saved = self.get_shapes()
+        n_chains_flat = math.prod(batch_shape) * n_chains
+        return n_chains_flat, n_saved
+
+    def _get_iterations(self) -> Int[Array, "n_saved"]:
+        # states.iterations is (*batch, n_chains, n_steps,) for EMC
+        # states.iterations is (n_steps,) for EMC
+        return reduce(self.iterations, "... n_saved -> n_saved", take_first)
+
+    @staticmethod
+    def _flatten_batched_scalar(
+        arr: Float[Array, "*batch n_chains n_saved"],
+    ) -> Float[Array, "flat_n_chains n_saved"]:
+        return rearrange(arr, "... n_chains n_saved -> (n_chains ...) n_saved")
+
+    def _get_log_likelihoods(self) -> Float[Array, "flat_n_chains n_saved"]:
+        return self._flatten_batched_scalar(self.states.log_likelihood)
+
+    def _get_iterand_n_accepted(self) -> Int[Array, "flat_n_chains n_saved"]:
+        return self._flatten_batched_scalar(self.iterand_n_accepted)
+
+    def _get_iterand_n_swap_accepted(self) -> Int[Array, "flat_n_pairs n_saved"]:
+        if self.iterand_n_swap_accepted is None:
+            raise ValueError(
+                "No swap acceptance data available for non-parallel tempering history."
+            )
+        return self._flatten_batched_scalar(self.iterand_n_swap_accepted)
+
+    def __resolve_get_hyperparameter(
+        self,
+        varying: bool,
+        arr: Float[Array, ""]
+        | Float[Array, "n_chains"]
+        | Float[Array, "n_saved n_chains"],
+    ) -> Float[Array, "flat_n_chains n_saved"]:
+        batch_shape, n_chains, n_saved = self.get_shapes()
+        n_chains_flat = math.prod(batch_shape) * n_chains
+
+        match varying, arr.shape:
+            case (False, (1,)):
+                return repeat(
+                    arr,
+                    "s -> (s n_chains) n_saved",
+                    n_chains=n_chains_flat,
+                    n_saved=n_saved,
+                )
+            case (False, (_n_chains,)) if _n_chains == n_chains:
+                return repeat(arr, "n_chains -> n_chains n_saved", n_saved=n_saved)
+            case (False, (*_batch_shape, _n_chains)) if (
+                _batch_shape == batch_shape and _n_chains == n_chains
+            ):
+                return repeat(
+                    arr, "... n_chains -> (n_chains ...) n_saved", n_saved=n_saved
+                )
+            # Varying hyperparameters must have a value for each saved iteration
+            case (True, (_n_saved,)) if _n_saved == n_saved:
+                return repeat(
+                    arr, "n_saved -> (n_chains n_saved)", n_chains=n_chains_flat
+                )
+            case (True, (_n_chains, _n_saved)) if (
+                _n_chains == n_chains and _n_saved == n_saved
+            ):
+                return arr
+            case (True, (*_batch_shape, _n_chains, n_saved)) if (
+                _batch_shape == batch_shape
+                and _n_chains == n_chains
+                and _n_saved == n_saved
+            ):
+                return rearrange(arr, "... n_chains n_saved -> (n_chains ...) n_saved")
+            case _:
+                raise ValueError(f"Invalid shape: {arr.shape} given {self}")
+
+    def _get_betas(self) -> Float[Array, "flat_n_chains n_saved"]:
+        return self.__resolve_get_hyperparameter(self.varying_betas, self.betas)
+
+    def _get_step_sizes(self) -> Float[Array, "flat_n_chains n_saved"]:
+        return self.__resolve_get_hyperparameter(
+            self.varying_step_sizes, self.step_sizes
+        )
+
+    def _get_colors_and_labels(self):
+        n = self.n_chains_flat
+        betas = self._get_betas()
+        colors = plt.cm.viridis(np.linspace(0.1, 0.9, max(n, 2)))[:n]
+        stride = max(1, n // 10)
+
+        def c_label(i):
+            if i % stride == 0:
+                beta = betas[i, 0]
+                return f"Chain {i} ($β_0={beta:.3g}$)"
+            return "_nolegend_"
+
+        labels = [c_label(i) for i in range(n)]
+        return colors, labels
+
+    def plot_step_sizes(self, ax=None, **kwargs):
+        """
+        Plots the step size trajectories across MCMC iterations.
+        If step sizes are fixed, these will appear as horizontal lines.
+        """
+        if ax is None:
+            _, ax = plt.subplots(figsize=kwargs.get("figsize", (8, 5)))
+
+        steps = self._get_iterations()
+        step_sizes = self._get_step_sizes()
+        n_chains_flat = self.n_chains_flat
+
+        colors, labels = self._get_colors_and_labels()
+
+        for i in range(n_chains_flat):
+            c = colors[i] if i < len(colors) else "black"
+            l = labels[i] if i < len(labels) else f"Chain {i}"
+            ax.plot(steps, step_sizes[i], color=c, lw=1.5, alpha=0.9, label=l)
+
+        # Update title based on whether tuning occurred
+        title = "Tuning: Step Sizes" if self.varying_step_sizes else "Fixed Step Sizes"
+        ax.set_title(title)
+        ax.set_xlabel("MCMC Step")
+        ax.set_ylabel("Step size")
+        ax.legend(fontsize=8, ncol=kwargs.get("legend_ncol", 2), frameon=True)
+
+        return ax
+
+    def plot_log_likelihoods(self, ax=None, **kwargs):
+        if ax is None:
+            _, ax = plt.subplots(figsize=kwargs.get("figsize", (8, 5)))
+
+        steps = self._get_iterations()
+        log_likelihoods = self._get_log_likelihoods()
+
+        n_chains_flat = self.n_chains_flat
+        mean_log_likelihoods = reduce(
+            log_likelihoods, "n_chains_flat n_saved -> n_saved", "mean"
+        )
+
+        colors, labels = self._get_colors_and_labels()
+
+        for i in range(n_chains_flat):
+            c = colors[i] if i < len(colors) else "black"
+            l = labels[i] if i < len(labels) else f"Chain {i}"
+            ax.plot(steps, log_likelihoods[i], color=c, lw=1.3, alpha=0.85, label=l)
+
+        if n_chains_flat > 1:
+            ax.plot(steps, mean_log_likelihoods, color="black", lw=2.6, label="Average")
+
+        ax.set_title("Log-Likelihood Trace")
+        ax.set_xlabel("MCMC Step")
+        ax.set_ylabel("Log-likelihood")
+        ax.legend(fontsize=8, frameon=True)
+        return ax
+
+    def plot_autocorrelation(self, ax=None, max_lag: int = 250, **kwargs):
+        if ax is None:
+            _, ax = plt.subplots(figsize=kwargs.get("figsize", (8, 5)))
+
+        log_likelihoods = self._get_log_likelihoods()
+        n_chains_flat, n_saved = self.get_flat_shape()
+
+        max_lag = min(max_lag, n_saved - 1)
+        lags = np.arange(max_lag + 1)
+
+        # Compute ACF via statsmodels
+        acf_logL = np.array(
+            [
+                acf(log_likelihoods[i], nlags=max_lag, fft=True)
+                for i in range(n_chains_flat)
+            ]
+        )
+
+        colors, labels = self._get_colors_and_labels()
+
+        for i in range(n_chains_flat):
+            c = colors[i] if i < len(colors) else "black"
+            l = labels[i] if i < len(labels) else f"Chain {i}"
+            ax.plot(lags, acf_logL[i], color=c, lw=1.2, alpha=0.85, label=l)
+
+        if n_chains_flat > 1:
+            ax.plot(
+                lags, acf_logL.mean(axis=0), color="black", lw=2.6, label="Average ACF"
+            )
+
+        ax.axhline(0.0, color="gray", lw=1.0)
+        ax.set_title("Log-Likelihood Autocorrelation")
+        ax.set_xlabel("Lag")
+        ax.set_ylabel("ACF")
+        ax.set_ylim(-0.2, 1.05)
+        ax.legend(fontsize=8, frameon=True)
+        return ax
+
+    def plot_local_acceptance(
+        self, ax=None, window: int = 75, target: float = 0.25, **kwargs
+    ):
+        if ax is None:
+            _, ax = plt.subplots(figsize=kwargs.get("figsize", (8, 5)))
+
+        steps = self._get_iterations()
+        n_acc = self._get_iterand_n_accepted()
+        n_chains_flat = n_acc.shape[0]
+
+        # Prevent NumPy convolve shape mismatch when history is shorter than the window
+        window = max(1, min(window, len(steps)))
+
+        block_sizes = np.diff(np.concatenate(([0], steps)))
+
+        kernel = np.ones(window)
+        roll_attempts = np.convolve(block_sizes, kernel, mode="valid")
+        roll_steps = steps[window - 1 :]
+
+        colors, labels = self._get_colors_and_labels()
+
+        roll_rates = []
+        for i in range(n_chains_flat):
+            # Fallback color/label in case of many flat chains
+            c = colors[i] if i < len(colors) else "black"
+            l = labels[i] if i < len(labels) else f"Chain {i}"
+
+            roll_acc = np.convolve(n_acc[i], kernel, mode="valid")
+            rate = roll_acc / roll_attempts
+            roll_rates.append(rate)
+            ax.plot(roll_steps, rate, color=c, lw=1.2, alpha=0.9, label=l)
+
+        if n_chains_flat > 1:
+            ax.plot(
+                roll_steps,
+                np.mean(roll_rates, axis=0),
+                color="black",
+                lw=2.6,
+                label="Average",
+            )
+
+        ax.axhline(
+            target,
+            color="crimson",
+            ls="--",
+            lw=1.4,
+            alpha=0.9,
+            label=f"Target {target:.2f}",
+        )
+        ax.set_title(f"Within-Chain Acceptance (Window={window})")
+        ax.set_xlabel("MCMC Step")
+        ax.set_ylabel("Acceptance rate")
+        ax.set_ylim(0.0, 1.0)
+        ax.legend(fontsize=8, frameon=True)
+        return ax
+
+    def plot_swap_acceptance(
+        self, ax=None, window: int = 75, target: float = 0.25, **kwargs
+    ):
+        if self.iterand_n_swap_accepted is None:
+            raise ValueError(
+                "Swap acceptance can only be plotted for parallel tempering histories"
+            )
+        if ax is None:
+            _, ax = plt.subplots(figsize=kwargs.get("figsize", (8, 5)))
+
+        steps = self._get_iterations()
+        n_acc = self._get_iterand_n_swap_accepted()
+        n_chains_flat = n_acc.shape[0]
+
+        # Prevent NumPy convolve shape mismatch when history is shorter than the window
+        window = max(1, min(window, len(steps)))
+
+        block_sizes = np.diff(np.concatenate(([0], steps)))
+
+        kernel = np.ones(window)
+        roll_attempts = np.convolve(block_sizes, kernel, mode="valid")
+        roll_steps = steps[window - 1 :]
+
+        colors, labels = self._get_colors_and_labels()
+
+        roll_rates = []
+        for i in range(n_chains_flat):
+            # Fallback color/label in case of many flat chains
+            c = colors[i] if i < len(colors) else "black"
+            l = labels[i] if i < len(labels) else f"Chain {i}"
+
+            roll_acc = np.convolve(n_acc[i], kernel, mode="valid")
+            rate = roll_acc / roll_attempts
+            roll_rates.append(rate)
+            ax.plot(roll_steps, rate, color=c, lw=1.2, alpha=0.9, label=l)
+
+        if n_chains_flat > 1:
+            ax.plot(
+                roll_steps,
+                np.mean(roll_rates, axis=0),
+                color="black",
+                lw=2.6,
+                label="Average",
+            )
+
+        ax.axhline(
+            target,
+            color="crimson",
+            ls="--",
+            lw=1.4,
+            alpha=0.9,
+            label=f"Target {target:.2f}",
+        )
+        ax.set_title(f"Inter-Chain Acceptance (Window={window})")
+        ax.set_xlabel("MCMC Step")
+        ax.set_ylabel("Swap acceptance rate")
+        ax.set_ylim(0.0, 1.0)
+        ax.legend(fontsize=8, frameon=True)
+        return ax
+
+    def plot_diagnostics(
+        self,
+        window: int = 75,
+        max_lag: int = 250,
+        target_chain: float = 0.25,
+        target_swap: float = 0.25,
+        title: str = "MCMC Diagnostics",
+    ):
+        plt.style.use("seaborn-v0_8-whitegrid")
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
+
+        self.plot_log_likelihoods(ax=axes[0, 0])
+        self.plot_autocorrelation(ax=axes[0, 1], max_lag=max_lag)
+        self.plot_local_acceptance(ax=axes[1, 0], window=window, target=target_chain)
+
+        if self.iterand_n_swap_accepted is not None:
+            self.plot_swap_acceptance(ax=axes[1, 1], window=window, target=target_swap)
+
+        fig.suptitle(title, fontsize=16, y=1.02)
+        plt.show()
+        return fig, axes
 
 
 class ExtendedMetropolisChain(eqx.Module):
@@ -204,7 +595,20 @@ class ExtendedMetropolisChain(eqx.Module):
 
         carry_final, history = jax.lax.scan(scan_fn, initial_carry, scan_inputs)
         final_state, _ = carry_final
-        return final_state, history
+
+        history_obj = History(
+            iterations=history[0],
+            states=history[1],
+            iterand_n_accepted=history[2],
+            states_accepted=history[3],
+            states_swap_accepted=None,
+            iterand_n_swap_accepted=None,
+            betas=self.beta,
+            step_sizes=self.proposal_dist.step_size,
+            varying_step_sizes=False,
+            varying_betas=False,
+        )
+        return final_state, history_obj
 
     @eqx.filter_jit
     def tune(
@@ -332,6 +736,22 @@ class ExtendedMetropolisChain(eqx.Module):
         final_chain = eqx.tree_at(
             lambda c: c.proposal_dist.step_size, chain_template, final_step_size
         )
+
+        print(flat_history)
+
+        # history_obj = History(
+        #     iterations=flat_history[0],
+        #     states=flat_history[1],
+        #     iterand_n_accepted=flat_history[3],
+        #     states_accepted=flat_history[4],
+        #     states_swap_accepted=None,
+        #     iterand_n_swap_accepted=None,
+        #     betas=final_chain.beta,
+        #     step_sizes=flat_history[2],
+        #     varying_step_sizes=True,
+        #     varying_betas=False,
+        # )
+
         return final_chain, final_iter_state, flat_history
 
 
@@ -557,7 +977,25 @@ class ParallelTemperingSampler(eqx.Module):
         scan_inputs = jnp.arange(n_saved, dtype=jnp.int32)
 
         final_states, history = jax.lax.scan(outer_scan_fn, initial_carry, scan_inputs)
-        return final_states, history
+
+        # This has produced ordering (n_saved, n_chains), but we want (n_chains, n_saved)
+        # Swap (n_saved, n_chains) -> (n_chains, n_saved)
+        def _swap_chain_saved(arr):
+            return jnp.swapaxes(arr, 0, 1)
+
+        history_obj = History(
+            iterations=history[0],  # Shape: (n_saved,) - No transpose needed
+            states=jax.tree_util.tree_map(_swap_chain_saved, history[1]),
+            iterand_n_accepted=_swap_chain_saved(history[3]),
+            states_accepted=_swap_chain_saved(history[5]),
+            states_swap_accepted=_swap_chain_saved(history[4]),
+            iterand_n_swap_accepted=_swap_chain_saved(history[2]),
+            betas=self.chains.beta,
+            step_sizes=self.chains.proposal_dist.step_size,
+            varying_step_sizes=False,
+            varying_betas=False,
+        )
+        return final_states, history_obj
 
     @eqx.filter_jit
     def tune(
@@ -753,6 +1191,203 @@ class ParallelTemperingSampler(eqx.Module):
 
         flat_history = jax.tree_util.tree_map(
             lambda x: x.reshape((n_saved,) + x.shape[2:]), history
+        )
+
+        return tuned_sampler, final_iter_states, flat_history
+
+    @eqx.filter_jit
+    def tune_step_sizes(
+        self,
+        n_steps_tune: int,
+        tune_interval: int,
+        key: Key,
+        iter_states: IterationState,
+        observations: Observations,
+        initial_step_size: Float[Array, "..."] | None = None,
+        target_chain_acceptance_rate: float = 0.25,
+        learning_rate: float = 1.0,
+        learning_rate_decay: float = 0.5,
+        keep_interval: int = 1,
+        progress: bool = False,
+        jax_tqdm_kwargs: dict[str, Any] | None = None,
+    ):
+        if tune_interval % keep_interval != 0:
+            raise ValueError(
+                f"tune_interval ({tune_interval}) must be a multiple of keep_interval ({keep_interval})"
+            )
+        if n_steps_tune % tune_interval != 0:
+            raise ValueError(
+                f"n_steps_tune ({n_steps_tune}) must be a multiple of tune_interval ({tune_interval})"
+            )
+
+        n_tune_intervals = n_steps_tune // tune_interval
+        saves_per_tune = tune_interval // keep_interval
+        n_saved = n_steps_tune // keep_interval
+        sampler = self
+
+        if initial_step_size is not None:
+            sampler = eqx.tree_at(
+                lambda s: s.chains.proposal_dist.step_size, sampler, initial_step_size
+            )
+
+        dtype = jnp.asarray(sampler.chains.beta).dtype
+        learning_rates = learning_rate * (
+            jnp.arange(n_tune_intervals, dtype=dtype) + 1
+        ) ** (-learning_rate_decay)
+
+        def outer_scan_fn(outer_carry, scan_input):
+            i_tune, lr = scan_input
+            samp, st = outer_carry
+
+            def inner_step_fn(inner_carry, inner_input):
+                i_iter = inner_input
+                s, acc_sw, acc_loc, att_sw = inner_carry
+
+                step_key = jax.random.fold_in(key, i_iter)
+                offset = i_iter % 2
+
+                nst, sw_acc, loc_acc = samp._step_with_swap(
+                    key=step_key,
+                    iter_states=s,
+                    observations=observations,
+                    swap_offset=offset,
+                )
+
+                idx1 = jnp.arange(samp.n_chains - 1)
+                eligibility = (idx1 % 2) == offset
+
+                acc_sw = acc_sw + sw_acc.astype(jnp.int32)
+                acc_loc = acc_loc + loc_acc.astype(jnp.int32)
+                att_sw = att_sw + eligibility.astype(jnp.int32)
+
+                return (nst, acc_sw, acc_loc, att_sw), None
+
+            if progress:
+                tqdm_kwargs = {} if jax_tqdm_kwargs is None else jax_tqdm_kwargs
+                tqdm_kwargs = (
+                    _DEFAULT_JAX_TQDM_KWARGS | {"desc": "PT Step Tuning"} | tqdm_kwargs
+                )
+                inner_scan_tqdm = scan_tqdm(n_steps_tune, **tqdm_kwargs)(inner_step_fn)
+            else:
+                inner_scan_tqdm = inner_step_fn
+
+            def middle_scan_fn(mid_carry, mid_input):
+                i_save_start = mid_input
+                current_st, total_sw_acc, total_loc_acc, total_sw_att = mid_carry
+
+                inner_init = (
+                    current_st,
+                    jnp.zeros(samp.n_chains - 1, dtype=jnp.int32),
+                    jnp.zeros(samp.n_chains, dtype=jnp.int32),
+                    jnp.zeros(samp.n_chains - 1, dtype=jnp.int32),
+                )
+                inner_inputs = i_save_start + jnp.arange(keep_interval, dtype=jnp.int32)
+
+                if progress:
+                    wrapped_inner_init = PBar(id=0, carry=inner_init)
+                    final_pbar = jax.lax.scan(
+                        inner_scan_tqdm, wrapped_inner_init, inner_inputs
+                    )
+                    next_st, chunk_sw_acc, chunk_loc_acc, chunk_sw_att = (
+                        final_pbar.carry
+                    )
+                else:
+                    (next_st, chunk_sw_acc, chunk_loc_acc, chunk_sw_att), _ = (
+                        jax.lax.scan(inner_scan_tqdm, inner_init, inner_inputs)
+                    )
+
+                next_total_sw_acc = total_sw_acc + chunk_sw_acc
+                next_total_loc_acc = total_loc_acc + chunk_loc_acc
+                next_total_sw_att = total_sw_att + chunk_sw_att
+
+                current_iteration = i_save_start + keep_interval
+                chunk_loc_acc_rate = chunk_loc_acc / keep_interval
+                chunk_sw_acc_rate = jnp.where(
+                    chunk_sw_att > 0, chunk_sw_acc / chunk_sw_att, 0.0
+                )
+
+                history_entry = (
+                    current_iteration,
+                    next_st,
+                    samp.chains.proposal_dist.step_size,
+                    chunk_loc_acc_rate,
+                    chunk_sw_acc_rate,
+                )
+
+                return (
+                    next_st,
+                    next_total_sw_acc,
+                    next_total_loc_acc,
+                    next_total_sw_att,
+                ), history_entry
+
+            mid_init = (
+                st,
+                jnp.zeros(samp.n_chains - 1, dtype=jnp.int32),
+                jnp.zeros(samp.n_chains, dtype=jnp.int32),
+                jnp.zeros(samp.n_chains - 1, dtype=jnp.int32),
+            )
+            mid_inputs = (
+                i_tune * tune_interval
+                + jnp.arange(saves_per_tune, dtype=jnp.int32) * keep_interval
+            )
+
+            (
+                (final_st, total_tune_sw_acc, total_tune_loc_acc, total_tune_sw_att),
+                chunk_histories,
+            ) = jax.lax.scan(middle_scan_fn, mid_init, mid_inputs)
+
+            local_acceptance_rate = total_tune_loc_acc / tune_interval
+
+            step_size = jnp.asarray(samp.chains.proposal_dist.step_size)
+            if step_size.ndim == 0:
+                step_size = jnp.broadcast_to(step_size, (samp.n_chains,))
+
+            new_step_size = step_size * jnp.exp(
+                lr * (local_acceptance_rate - target_chain_acceptance_rate)
+            )
+            new_step_size = jnp.clip(new_step_size, 1e-5, 1.0)
+
+            new_chains = eqx.tree_at(
+                lambda c: c.proposal_dist.step_size,
+                samp.chains,
+                new_step_size,
+            )
+            new_samp = eqx.tree_at(lambda s: s.chains, samp, new_chains)
+
+            return (new_samp, final_st), chunk_histories
+
+        scan_inputs = (
+            jnp.arange(n_tune_intervals, dtype=jnp.int32),
+            learning_rates,
+        )
+        initial_carry = (sampler, iter_states)
+
+        final_carry, history = jax.lax.scan(outer_scan_fn, initial_carry, scan_inputs)
+        tuned_sampler, final_iter_states = final_carry
+
+        flat_history = jax.tree_util.tree_map(
+            lambda x: x.reshape((n_saved,) + x.shape[2:]), history
+        )
+
+        def _swap_chain_saved(arr):
+            return jnp.swapaxes(arr, 0, 1) if arr.ndim >= 2 else arr
+
+        history_obj = History(
+            iterations=flat_history[0],
+            states=jax.tree_util.tree_map(_swap_chain_saved, flat_history[1]),
+            step_sizes=_swap_chain_saved(flat_history[2]),
+            iterand_n_accepted=_swap_chain_saved(flat_history[3]),
+            betas=tuned_sampler.chains.beta,
+            iterand_n_swap_accepted=_swap_chain_saved(flat_history[4]),
+            states_accepted=jnp.zeros_like(
+                _swap_chain_saved(flat_history[3]), dtype=jnp.bool_
+            ),
+            states_swap_accepted=jnp.zeros_like(
+                _swap_chain_saved(flat_history[4]), dtype=jnp.bool_
+            ),
+            varying_step_sizes=True,
+            varying_betas=False,
         )
 
         return tuned_sampler, final_iter_states, flat_history
