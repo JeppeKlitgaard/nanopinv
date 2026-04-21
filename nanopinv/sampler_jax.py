@@ -250,6 +250,33 @@ class History(eqx.Module):
 
         return ax
 
+    def plot_betas(self, ax=None, **kwargs):
+        """
+        Plots beta (inverse temperature) trajectories across MCMC iterations.
+        If betas are fixed, these will appear as horizontal lines.
+        """
+        if ax is None:
+            _, ax = plt.subplots(figsize=kwargs.get("figsize", (8, 5)))
+
+        steps = self._get_iterations()
+        betas = self._get_betas()
+        n_chains_flat = self.n_chains_flat
+
+        colors, labels = self._get_colors_and_labels()
+
+        for i in range(n_chains_flat):
+            c = colors[i] if i < len(colors) else "black"
+            l = labels[i] if i < len(labels) else f"Chain {i}"
+            ax.plot(steps, betas[i], color=c, lw=1.5, alpha=0.9, label=l)
+
+        title = "Tuning: Betas" if self.varying_betas else "Fixed Betas"
+        ax.set_title(title)
+        ax.set_xlabel("MCMC Step")
+        ax.set_ylabel("Beta")
+        ax.legend(fontsize=8, ncol=kwargs.get("legend_ncol", 2), frameon=True)
+
+        return ax
+
     def plot_log_likelihoods(self, ax=None, **kwargs):
         if ax is None:
             _, ax = plt.subplots(figsize=kwargs.get("figsize", (8, 5)))
@@ -455,14 +482,45 @@ class History(eqx.Module):
         title: str = "MCMC Diagnostics",
     ):
         plt.style.use("seaborn-v0_8-whitegrid")
-        fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
-
-        self.plot_log_likelihoods(ax=axes[0, 0])
-        self.plot_autocorrelation(ax=axes[0, 1], max_lag=max_lag)
-        self.plot_local_acceptance(ax=axes[1, 0], window=window, target=target_chain)
+        plotters = [
+            lambda ax: self.plot_log_likelihoods(ax=ax),
+            lambda ax: self.plot_autocorrelation(ax=ax, max_lag=max_lag),
+            lambda ax: self.plot_local_acceptance(
+                ax=ax, window=window, target=target_chain
+            ),
+        ]
 
         if self.iterand_n_swap_accepted is not None:
-            self.plot_swap_acceptance(ax=axes[1, 1], window=window, target=target_swap)
+            plotters.append(
+                lambda ax: self.plot_swap_acceptance(
+                    ax=ax, window=window, target=target_swap
+                )
+            )
+
+        if self.varying_step_sizes:
+            plotters.append(lambda ax: self.plot_step_sizes(ax=ax))
+
+        if self.varying_betas:
+            plotters.append(lambda ax: self.plot_betas(ax=ax))
+
+        n_plots = len(plotters)
+        n_cols = 2
+        n_rows = int(np.ceil(n_plots / n_cols))
+        fig_height = max(5 * n_rows, 5)
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(16, fig_height),
+            constrained_layout=True,
+        )
+
+        axes_flat = np.atleast_1d(axes).reshape(-1)
+
+        for ax, plot_fn in zip(axes_flat, plotters, strict=False):
+            plot_fn(ax)
+
+        for ax in axes_flat[n_plots:]:
+            ax.set_visible(False)
 
         fig.suptitle(title, fontsize=16, y=1.02)
         plt.show()
@@ -1011,7 +1069,7 @@ class ParallelTemperingSampler(eqx.Module):
         return final_states, history_obj
 
     @eqx.filter_jit
-    def tune(
+    def tune_jointly(
         self,
         n_steps_tune: int,
         tune_interval: int,
@@ -1225,17 +1283,17 @@ class ParallelTemperingSampler(eqx.Module):
         return tuned_sampler, final_iter_states, history_obj
 
     @eqx.filter_jit
-    def tune_step_sizes(
+    def _tune_single_parameter(
         self,
+        tune_target: Literal["step_size", "beta"],
         n_steps_tune: int,
         tune_interval: int,
         key: Key,
         iter_states: IterationState,
         observations: Observations,
-        initial_step_size: Float[Array, "..."] | None = None,
-        target_chain_acceptance_rate: float = 0.25,
-        learning_rate: float = 1.0,
-        learning_rate_decay: float = 0.5,
+        target_acceptance_rate: float,
+        learning_rate: float,
+        learning_rate_decay: float,
         keep_interval: int = 1,
         progress: bool = False,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
@@ -1253,11 +1311,6 @@ class ParallelTemperingSampler(eqx.Module):
         saves_per_tune = tune_interval // keep_interval
         n_saved = n_steps_tune // keep_interval
         sampler = self
-
-        if initial_step_size is not None:
-            sampler = eqx.tree_at(
-                lambda s: s.chains.proposal_dist.step_size, sampler, initial_step_size
-            )
 
         dtype = jnp.asarray(sampler.chains.beta).dtype
         learning_rates = learning_rate * (
@@ -1293,9 +1346,10 @@ class ParallelTemperingSampler(eqx.Module):
 
             if progress:
                 tqdm_kwargs = {} if jax_tqdm_kwargs is None else jax_tqdm_kwargs
-                tqdm_kwargs = (
-                    _DEFAULT_JAX_TQDM_KWARGS | {"desc": "PT Step Tuning"} | tqdm_kwargs
+                desc = (
+                    "PT Step Tuning" if tune_target == "step_size" else "PT Beta Tuning"
                 )
+                tqdm_kwargs = _DEFAULT_JAX_TQDM_KWARGS | {"desc": desc} | tqdm_kwargs
                 inner_scan_tqdm = scan_tqdm(n_steps_tune, **tqdm_kwargs)(inner_step_fn)
             else:
                 inner_scan_tqdm = inner_step_fn
@@ -1331,11 +1385,14 @@ class ParallelTemperingSampler(eqx.Module):
 
                 current_iteration = i_save_start + keep_interval
 
+                # We save both into the history so the History object can pull
+                # the respective series for the tuned parameter.
                 history_entry = (
                     current_iteration,
                     next_st,
                     samp.chains.proposal_dist.step_size,
                     chunk_loc_acc,
+                    samp.chains.beta,
                     chunk_sw_acc,
                 )
 
@@ -1362,22 +1419,44 @@ class ParallelTemperingSampler(eqx.Module):
                 chunk_histories,
             ) = jax.lax.scan(middle_scan_fn, mid_init, mid_inputs)
 
-            local_acceptance_rate = total_tune_loc_acc / tune_interval
+            if tune_target == "step_size":
+                local_acceptance_rate = total_tune_loc_acc / tune_interval
 
-            step_size = jnp.asarray(samp.chains.proposal_dist.step_size)
-            if step_size.ndim == 0:
-                step_size = jnp.broadcast_to(step_size, (samp.n_chains,))
+                step_size = jnp.asarray(samp.chains.proposal_dist.step_size)
+                if step_size.ndim == 0:
+                    step_size = jnp.broadcast_to(step_size, (samp.n_chains,))
 
-            new_step_size = step_size * jnp.exp(
-                lr * (local_acceptance_rate - target_chain_acceptance_rate)
-            )
-            new_step_size = jnp.clip(new_step_size, 1e-5, 1.0)
+                new_step_size = step_size * jnp.exp(
+                    lr * (local_acceptance_rate - target_acceptance_rate)
+                )
+                new_step_size = jnp.clip(new_step_size, 1e-5, 1.0)
 
-            new_chains = eqx.tree_at(
-                lambda c: c.proposal_dist.step_size,
-                samp.chains,
-                new_step_size,
-            )
+                new_chains = eqx.tree_at(
+                    lambda c: c.proposal_dist.step_size,
+                    samp.chains,
+                    new_step_size,
+                )
+
+            elif tune_target == "beta":
+                swap_acceptance_rate = jnp.where(
+                    total_tune_sw_att > 0, total_tune_sw_acc / total_tune_sw_att, 0.0
+                )
+
+                new_betas = samp._update_betas(
+                    samp.chains.beta,
+                    swap_acceptance_rate,
+                    learning_rate=lr,
+                    target_acceptance=target_acceptance_rate,
+                )
+
+                new_chains = eqx.tree_at(
+                    lambda c: c.beta,
+                    samp.chains,
+                    new_betas,
+                )
+            else:
+                raise ValueError(f"Unknown tuning target: {tune_target}")
+
             new_samp = eqx.tree_at(lambda s: s.chains, samp, new_chains)
 
             return (new_samp, final_st), chunk_histories
@@ -1398,21 +1477,98 @@ class ParallelTemperingSampler(eqx.Module):
         def _swap_chain_saved(arr):
             return jnp.swapaxes(arr, 0, 1) if arr.ndim >= 2 else arr
 
+        tracked_step_sizes = _swap_chain_saved(flat_history[2])
+        tracked_betas = _swap_chain_saved(flat_history[4])
+
         history_obj = History(
             iterations=flat_history[0],
             states=jax.tree_util.tree_map(_swap_chain_saved, flat_history[1]),
-            step_sizes=_swap_chain_saved(flat_history[2]),
+            step_sizes=tracked_step_sizes
+            if tune_target == "step_size"
+            else tuned_sampler.chains.proposal_dist.step_size,
             iterand_n_accepted=_swap_chain_saved(flat_history[3]),
-            betas=tuned_sampler.chains.beta,
-            iterand_n_swap_accepted=_swap_chain_saved(flat_history[4]),
+            betas=tracked_betas if tune_target == "beta" else tuned_sampler.chains.beta,
+            iterand_n_swap_accepted=_swap_chain_saved(flat_history[5]),
             states_accepted=jnp.zeros_like(
                 _swap_chain_saved(flat_history[3]), dtype=jnp.bool_
             ),
             states_swap_accepted=jnp.zeros_like(
-                _swap_chain_saved(flat_history[4]), dtype=jnp.bool_
+                _swap_chain_saved(flat_history[5]), dtype=jnp.bool_
             ),
-            varying_step_sizes=True,
-            varying_betas=False,
+            varying_step_sizes=(tune_target == "step_size"),
+            varying_betas=(tune_target == "beta"),
         )
 
         return tuned_sampler, final_iter_states, history_obj
+
+    @eqx.filter_jit
+    def tune_step_sizes(
+        self,
+        n_steps_tune: int,
+        tune_interval: int,
+        key: Key,
+        iter_states: IterationState,
+        observations: Observations,
+        initial_step_size: Float[Array, "..."] | None = None,
+        target_chain_acceptance_rate: float = 0.25,
+        learning_rate: float = 1.0,
+        learning_rate_decay: float = 0.5,
+        keep_interval: int = 1,
+        progress: bool = False,
+        jax_tqdm_kwargs: dict[str, Any] | None = None,
+    ):
+        sampler = self
+        if initial_step_size is not None:
+            sampler = eqx.tree_at(
+                lambda s: s.chains.proposal_dist.step_size, sampler, initial_step_size
+            )
+
+        return sampler._tune_single_parameter(
+            tune_target="step_size",
+            n_steps_tune=n_steps_tune,
+            tune_interval=tune_interval,
+            key=key,
+            iter_states=iter_states,
+            observations=observations,
+            target_acceptance_rate=target_chain_acceptance_rate,
+            learning_rate=learning_rate,
+            learning_rate_decay=learning_rate_decay,
+            keep_interval=keep_interval,
+            progress=progress,
+            jax_tqdm_kwargs=jax_tqdm_kwargs,
+        )
+
+    @eqx.filter_jit
+    def tune_betas(
+        self,
+        n_steps_tune: int,
+        tune_interval: int,
+        key: Key,
+        iter_states: IterationState,
+        observations: Observations,
+        initial_betas: Float[Array, "n_chains"] | None = None,
+        target_swap_acceptance_rate: float = 0.25,
+        learning_rate: float = 1.0,
+        learning_rate_decay: float = 0.5,
+        keep_interval: int = 1,
+        progress: bool = False,
+        jax_tqdm_kwargs: dict[str, Any] | None = None,
+    ):
+        sampler = self
+        if initial_betas is not None:
+            sampler = eqx.tree_at(lambda s: s.chains.beta, sampler, initial_betas)
+
+        return sampler._tune_single_parameter(
+            tune_target="beta",
+            n_steps_tune=n_steps_tune,
+            tune_interval=tune_interval,
+            key=key,
+            iter_states=iter_states,
+            observations=observations,
+            target_acceptance_rate=target_swap_acceptance_rate,
+            learning_rate=learning_rate,
+            learning_rate_decay=learning_rate_decay,
+            keep_interval=keep_interval,
+            progress=progress,
+            jax_tqdm_kwargs=jax_tqdm_kwargs,
+        )
