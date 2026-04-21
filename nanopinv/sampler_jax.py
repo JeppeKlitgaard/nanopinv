@@ -389,10 +389,13 @@ class History(eqx.Module):
         # Prevent NumPy convolve shape mismatch when history is shorter than the window
         window = max(1, min(window, len(steps)))
 
-        block_sizes = np.diff(np.concatenate(([0], steps)))
+        # Insert 0 at the beginning to accurately pinpoint alternating swap availabilities
+        steps_padded = np.concatenate(([0], steps))
+        start = steps_padded[:-1]
+        end = steps_padded[1:]
+        length = end - start
 
         kernel = np.ones(window)
-        roll_attempts = np.convolve(block_sizes, kernel, mode="valid")
         roll_steps = steps[window - 1 :]
 
         colors, labels = self._get_colors_and_labels()
@@ -403,8 +406,19 @@ class History(eqx.Module):
             c = colors[i] if i < len(colors) else "black"
             l = labels[i] if i < len(labels) else f"Chain {i}"
 
+            # Safely capture exact local eligibility offsets irrespective of iteration length bounds
+            attempts = length // 2 + np.where(
+                (length % 2 == 1) & (start % 2 == i % 2), 1, 0
+            )
             roll_acc = np.convolve(n_acc[i], kernel, mode="valid")
-            rate = roll_acc / roll_attempts
+            roll_att = np.convolve(attempts, kernel, mode="valid")
+
+            rate = np.divide(
+                roll_acc,
+                roll_att,
+                out=np.zeros_like(roll_acc, dtype=float),
+                where=roll_att != 0,
+            )
             roll_rates.append(rate)
             ax.plot(roll_steps, rate, color=c, lw=1.2, alpha=0.9, label=l)
 
@@ -700,8 +714,9 @@ class ExtendedMetropolisChain(eqx.Module):
 
                 next_total_acc = total_acc + chunk_acc
                 current_iteration = i_save_start + keep_interval
-                chunk_acc_rate = chunk_acc / keep_interval
-                history_entry = (current_iteration, next_st, step_sz, chunk_acc_rate)
+
+                # Pass chunk_acc over instead of chunk_acc_rate for the plot accuracy
+                history_entry = (current_iteration, next_st, step_sz, chunk_acc)
 
                 return (next_st, next_total_acc), history_entry
 
@@ -737,22 +752,20 @@ class ExtendedMetropolisChain(eqx.Module):
             lambda c: c.proposal_dist.step_size, chain_template, final_step_size
         )
 
-        print(flat_history)
+        history_obj = History(
+            iterations=flat_history[0],
+            states=flat_history[1],
+            iterand_n_accepted=flat_history[3],
+            states_accepted=jnp.zeros_like(flat_history[3], dtype=jnp.bool_),
+            states_swap_accepted=None,
+            iterand_n_swap_accepted=None,
+            betas=final_chain.beta,
+            step_sizes=flat_history[2],
+            varying_step_sizes=True,
+            varying_betas=False,
+        )
 
-        # history_obj = History(
-        #     iterations=flat_history[0],
-        #     states=flat_history[1],
-        #     iterand_n_accepted=flat_history[3],
-        #     states_accepted=flat_history[4],
-        #     states_swap_accepted=None,
-        #     iterand_n_swap_accepted=None,
-        #     betas=final_chain.beta,
-        #     step_sizes=flat_history[2],
-        #     varying_step_sizes=True,
-        #     varying_betas=False,
-        # )
-
-        return final_chain, final_iter_state, flat_history
+        return final_chain, final_iter_state, history_obj
 
 
 class ParallelTemperingSampler(eqx.Module):
@@ -1112,18 +1125,14 @@ class ParallelTemperingSampler(eqx.Module):
                 next_total_sw_att = total_sw_att + chunk_sw_att
 
                 current_iteration = i_save_start + keep_interval
-                chunk_loc_acc_rate = chunk_loc_acc / keep_interval
-                chunk_sw_acc_rate = jnp.where(
-                    chunk_sw_att > 0, chunk_sw_acc / chunk_sw_att, 0.0
-                )
 
                 history_entry = (
                     current_iteration,
                     next_st,
                     samp.chains.proposal_dist.step_size,
-                    chunk_loc_acc_rate,
+                    chunk_loc_acc,
                     samp.chains.beta,
-                    chunk_sw_acc_rate,
+                    chunk_sw_acc,
                 )
 
                 return (
@@ -1193,7 +1202,27 @@ class ParallelTemperingSampler(eqx.Module):
             lambda x: x.reshape((n_saved,) + x.shape[2:]), history
         )
 
-        return tuned_sampler, final_iter_states, flat_history
+        def _swap_chain_saved(arr):
+            return jnp.swapaxes(arr, 0, 1) if arr.ndim >= 2 else arr
+
+        history_obj = History(
+            iterations=flat_history[0],
+            states=jax.tree_util.tree_map(_swap_chain_saved, flat_history[1]),
+            step_sizes=_swap_chain_saved(flat_history[2]),
+            iterand_n_accepted=_swap_chain_saved(flat_history[3]),
+            betas=_swap_chain_saved(flat_history[4]),
+            iterand_n_swap_accepted=_swap_chain_saved(flat_history[5]),
+            states_accepted=jnp.zeros_like(
+                _swap_chain_saved(flat_history[3]), dtype=jnp.bool_
+            ),
+            states_swap_accepted=jnp.zeros_like(
+                _swap_chain_saved(flat_history[5]), dtype=jnp.bool_
+            ),
+            varying_step_sizes=True,
+            varying_betas=True,
+        )
+
+        return tuned_sampler, final_iter_states, history_obj
 
     @eqx.filter_jit
     def tune_step_sizes(
@@ -1285,7 +1314,7 @@ class ParallelTemperingSampler(eqx.Module):
 
                 if progress:
                     wrapped_inner_init = PBar(id=0, carry=inner_init)
-                    final_pbar = jax.lax.scan(
+                    final_pbar, _ = jax.lax.scan(
                         inner_scan_tqdm, wrapped_inner_init, inner_inputs
                     )
                     next_st, chunk_sw_acc, chunk_loc_acc, chunk_sw_att = (
@@ -1301,17 +1330,13 @@ class ParallelTemperingSampler(eqx.Module):
                 next_total_sw_att = total_sw_att + chunk_sw_att
 
                 current_iteration = i_save_start + keep_interval
-                chunk_loc_acc_rate = chunk_loc_acc / keep_interval
-                chunk_sw_acc_rate = jnp.where(
-                    chunk_sw_att > 0, chunk_sw_acc / chunk_sw_att, 0.0
-                )
 
                 history_entry = (
                     current_iteration,
                     next_st,
                     samp.chains.proposal_dist.step_size,
-                    chunk_loc_acc_rate,
-                    chunk_sw_acc_rate,
+                    chunk_loc_acc,
+                    chunk_sw_acc,
                 )
 
                 return (
@@ -1390,4 +1415,4 @@ class ParallelTemperingSampler(eqx.Module):
             varying_betas=False,
         )
 
-        return tuned_sampler, final_iter_states, flat_history
+        return tuned_sampler, final_iter_states, history_obj
