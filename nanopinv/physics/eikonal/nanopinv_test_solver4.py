@@ -5,7 +5,7 @@ from jax import numpy as jnp
 from nanopinv._typing import Array, Float
 
 
-def user_fsm_2d_single_source_jax(
+def user_fsm_2d_single_source(
     phi: Float[Array, "*grid"],
     speed: Float[Array, "*grid"],
     dr: Float[Array, "ndim"],
