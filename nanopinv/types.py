@@ -6,3 +6,10 @@ from nanopinv._typing import Array, Float
 class Observations(eqx.Module):
     data_obs: Float[Array, "N_data"]
     data_std: Float[Array, "N_data"]
+
+
+class ObservationsUnivariate(eqx.Module):
+    data_obs: Float[Array, "N_data"]
+    data_std: float
+
+ObservationsT = Observations | ObservationsUnivariate
