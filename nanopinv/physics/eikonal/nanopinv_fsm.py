@@ -82,7 +82,7 @@ def _get_axis_min_times(T, ndim):
     return jnp.stack(axis_mins, axis=0)
 
 
-def jacobi_single_source(
+def jacobi_single_source_old(
     phi: Float[Array, "*grid"],
     speed: Float[Array, "*grid"],
     dr: Float[Array, "ndim"],
@@ -118,7 +118,7 @@ def jacobi_single_source(
         if debug and debug_verbosity >= 2:
             if debug_verbosity >= 2:
                 jax.debug.print(
-                    "ITER: Iteration: {:d}, Max Diff: {:.12f}, Tolerance: {:.12f}",
+                    "ITER: Iteration: {:d}, Max Diff: {:.16f}, Tolerance: {:.16f}",
                     i,
                     diff,
                     tolerance_j,
@@ -162,7 +162,105 @@ def jacobi_single_source(
         terminated_because_iteration = i_final >= max_iter
 
         jax.debug.print(
-            "CONV: Tol: {:.12f}, Diff: {:.12f}, Iteration: {:d}, Tolerance Termination: {}, Iteration Termination: {}, Should Continue: False",
+            "CONV: Tol: {:.16f}, Diff: {:.16f}, Iteration: {:d}, Tolerance Termination: {}, Iteration Termination: {}, Should Continue: False",
+            tolerance_j,
+            diff_final,
+            i_final,
+            terminated_because_tolerance,
+            terminated_because_iteration,
+        )
+
+    return T_final
+
+
+def jacobi_single_source(
+    phi: Float[Array, "*grid"],
+    distance: Float[Array, "*grid"],
+    speed: Float[Array, "*grid"],
+    dr: Float[Array, "ndim"],
+    max_iter: int,
+    tolerance: float,
+    debug: bool,
+    debug_verbosity: int,
+) -> Float[Array, "*grid"]:
+    ndim = phi.ndim
+
+    # The nodes inside the analytical radius are permanently fixed
+    fixed_mask = phi <= 0.0
+
+    # Ensure at least the source node is caught if the radius is somehow too small
+    fallback_mask = distance == jnp.min(distance)
+    fixed_mask = jnp.where(jnp.any(fixed_mask), fixed_mask, fallback_mask)
+
+    # Initialize exact analytical time: Time = Distance / Velocity
+    # We extract the speed near the origin (using distance == 0 roughly)
+    v_source = jnp.max(jnp.where(distance == jnp.min(distance), speed, 0.0))
+
+    T_init = jnp.where(
+        fixed_mask,
+        jnp.asarray(distance / v_source, dtype=speed.dtype),
+        jnp.asarray(jnp.inf, dtype=speed.dtype),
+    )
+
+    spacing_sq_inv = 1.0 / (dr * dr)
+    inv_speed = 1.0 / speed
+    tolerance_j = jnp.asarray(tolerance, dtype=speed.dtype)
+
+    def cond_fun(state):
+        """
+        Returns True if the iteration should continue, False if it should stop.
+        """
+        T, diff, i = state
+        should_continue = (diff > tolerance_j) & (i < max_iter)
+
+        if debug and debug_verbosity >= 2:
+            if debug_verbosity >= 2:
+                jax.debug.print(
+                    "ITER: Iteration: {:d}, Max Diff: {:.16f}, Tolerance: {:.16f}",
+                    i,
+                    diff,
+                    tolerance_j,
+                )
+
+        return should_continue
+
+    def body_fun(state):
+        T, _, i = state
+        axis_min_times = _get_axis_min_times(T, ndim)
+        T_candidate = _vectorized_godunov_jax(
+            axis_min_times, spacing_sq_inv, inv_speed, dr
+        )
+
+        T_new = jnp.minimum(T, T_candidate)
+        T_new = jnp.where(fixed_mask, 0.0, T_new)
+
+        # T_new <= T ensures T - T_new >= 0. Abs is unnecessary.
+        diff = jnp.max(
+            jnp.where(
+                jnp.isfinite(T),
+                T - T_new,
+                jnp.where(jnp.isfinite(T_new), jnp.inf, 0.0),
+            )
+        )
+
+        return T_new, diff, i + 1
+
+    init_state = (
+        T_init,
+        jnp.asarray(jnp.inf, dtype=speed.dtype),
+        jnp.array(0, jnp.int32),
+    )
+
+    # Terminate at max_iter or tolerance
+    final_state = lax.while_loop(cond_fun, body_fun, init_state)
+    T_final, diff_final, i_final = final_state
+
+    if debug and debug_verbosity >= 1:
+        terminated_because_tolerance = diff_final <= tolerance_j
+        terminated_because_iteration = i_final >= max_iter
+
+        jax.debug.print(
+            "CONV: Tol: {:.16f}, Diff: {:.16f}, Iteration: {:d}, Tolerance Termination: {}, Iteration Termination: {}, Should Continue: False",
             tolerance_j,
             diff_final,
             i_final,
@@ -174,7 +272,7 @@ def jacobi_single_source(
 
 
 @jax.jit(static_argnames=("max_iter", "tolerance", "debug", "debug_verbosity"))
-def jacobi_multi_source(
+def jacobi_multi_source_old(
     phis: Float[Array, "N_sources *grid"],
     speed: Float[Array, "*grid"],
     dr: Float[Array, "ndim"],
@@ -184,7 +282,7 @@ def jacobi_multi_source(
     debug_verbosity: int,
 ):
     return jax.vmap(
-        lambda phi: jacobi_single_source(
+        lambda phi: jacobi_single_source_old(
             phi=phi,
             speed=speed,
             dr=dr,
@@ -195,3 +293,28 @@ def jacobi_multi_source(
         ),
         in_axes=0,
     )(phis)
+
+@jax.jit(static_argnames=("max_iter", "tolerance", "debug", "debug_verbosity"))
+def jacobi_multi_source(
+    phis: Float[Array, "N_sources *grid"],
+    distances: Float[Array, "N_sources *grid"],
+    speed: Float[Array, "*grid"],
+    dr: Float[Array, "ndim"],
+    max_iter: int,
+    tolerance: float,
+    debug: bool,
+    debug_verbosity: int,
+):
+    return jax.vmap(
+        lambda phi, distance: jacobi_single_source(
+            phi=phi,
+            distance=distance,
+            speed=speed,
+            dr=dr,
+            max_iter=max_iter,
+            tolerance=tolerance,
+            debug=debug,
+            debug_verbosity=debug_verbosity,
+        ),
+        in_axes=(0, 0),
+    )(phis, distances)

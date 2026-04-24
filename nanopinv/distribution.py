@@ -1,11 +1,11 @@
 from abc import abstractmethod
+from typing import Self
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
-from typing import Self
 
 from nanopinv._typing import Array, Float
 

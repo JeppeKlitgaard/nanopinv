@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 from itertools import product
-from typing import Literal
+from typing import Any, Literal
 
 import jax
 import numpy as np
@@ -10,11 +10,14 @@ from jax.scipy.interpolate import RegularGridInterpolator
 
 from nanopinv._typing import Array, Float
 from nanopinv.physics.eikonal.nanopinv_fsm import jacobi_multi_source
+from nanopinv.physics.eikonal.nanopinv_test_solver1 import (
+    build_fsm_stencils,
+    fast_sweeping_multi_source,
+)
+from nanopinv.physics.eikonal.nanopinv_test_solver2 import ifim_multi_source
 from nanopinv.physics.eikonal.nanopinv_test_solver3 import hyperplane_fsm_multi_source
 from nanopinv.physics.eikonal.nanopinv_test_solver4 import user_fsm_2d_multi_source
-from nanopinv.physics.eikonal.skfmm_fmm import skfmm_jax_caller
-from nanopinv.physics.eikonal.nanopinv_test_solver1 import fast_sweeping_multi_source, build_fsm_stencils
-from nanopinv.physics.eikonal.nanopinv_test_solver2 import ifim_multi_source
+from nanopinv.physics.eikonal.skfmm_fmm import make_skfmm_jax_caller
 
 _SOLVER_NAMES = (
     "skfmm:fmm",
@@ -79,21 +82,46 @@ def compute_phi(
     return phi
 
 
+@jax.jit(static_argnames=["radius_multiplier"])
+def compute_phi_and_distance(
+    source: Float[Array, "ndim"],
+    r: Sequence[Float[Array, "ax"]],
+    dr: Float[Array, "ndim"],
+    radius_multiplier: float,
+):
+    ndim = len(r)
+
+    # 1. Compute global Euclidean distance smoothly across the whole grid
+    mesh = jnp.meshgrid(*r, indexing="ij")
+    dist_sq = jnp.zeros_like(mesh[0])
+    for i in range(ndim):
+        dist_sq += (mesh[i] - source[i]) ** 2
+    distance = jnp.sqrt(dist_sq)
+
+    # 2. Define an analytical radius to bypass the singularity
+    # We use 2.5x the smallest grid spacing to ensure a healthy ring of nodes
+    radius = radius_multiplier * jnp.min(dr)
+
+    # 3. The level-set is the distance shifted by the radius
+    phi = distance - radius
+
+    return phi, distance, radius
+
+
 def build_travel_time_points(
     sources,
     receivers,
     *grid_axes,
     solver: _SolverNameT,
-    order: int = 2,
-    window: int = 1,
-    fsm_max_sweeps: int = 64,
-    fsm_tolerance: float = 1e-8,
-    jacobi_max_iter: int = 2000,
+    radius_multiplier: float = 1.5,
+    solver_kwargs: dict | None = None,
     debug: bool = False,
     debug_verbosity: int = 1,
 ):
     if solver not in _SOLVER_NAMES:
         raise ValueError(f"solver must be one of {_SOLVER_NAMES}")
+
+    solver_kwargs = {} if solver_kwargs is None else solver_kwargs
 
     unique_sources, inverse_sources = np.unique(sources, axis=0, return_inverse=True)
 
@@ -120,37 +148,61 @@ def build_travel_time_points(
 
     shape_grid = tuple(len(arr) for arr in r)
 
-    vmap_compute_phi = jax.vmap(compute_phi, in_axes=(0, None, None))
-    phis_batched = vmap_compute_phi(unique_sources_j, r, window)
+    vmap_compute_phi_and_distance = jax.vmap(
+        compute_phi_and_distance, in_axes=(0, None, None, None), out_axes=(0, 0, None)
+    )
+    phis_batched, distances_batched, radius = vmap_compute_phi_and_distance(
+        unique_sources_j, r, dr, radius_multiplier
+    )
 
     match solver:
         case "nanopinv:fsm":
+            max_iter: int = solver_kwargs.get("max_iter", 2000)
+            tolerance: float = solver_kwargs.get("tolerance", 1e-8)
 
             @jax.jit
             def solve_eikonal(m_single: Float[Array, "*grid"]):
                 return jacobi_multi_source(
                     phis=phis_batched,
+                    distances=distances_batched,
                     speed=m_single,
                     dr=dr,
-                    max_iter=jacobi_max_iter,
-                    tolerance=fsm_tolerance,
+                    max_iter=max_iter,
+                    tolerance=tolerance,
                     debug=debug,
                     debug_verbosity=debug_verbosity,
                 )
 
         case "skfmm:fmm":
+            order: int = solver_kwargs.get("order", 2)
+            chunk_size: int = solver_kwargs.get("chunk_size", 64)
+            parallel_args: dict[str, Any] = solver_kwargs.get("parallel_args", {})
+            jax_caller = make_skfmm_jax_caller(
+                radius=float(radius),  # Must convert to Python float, we get JAX array back
+                order=order,
+                chunk_size=chunk_size,
+                parallel_args=parallel_args,
+            )
 
             @jax.jit
             def solve_eikonal(m_single: Float[Array, "*grid"]):
-                return skfmm_jax_caller(phis_batched, m_single, dr, order)
+                return jax_caller(
+                    phis=phis_batched,
+                    distances=distances_batched,
+                    dr=dr,
+                    speed=m_single,
+                )
 
         case "nanopinv:test_solver1":
-            sweep_orders_np, neighbors_minus_np, neighbors_plus_np = (
-                build_fsm_stencils(shape_grid)
+            sweep_orders_np, neighbors_minus_np, neighbors_plus_np = build_fsm_stencils(
+                shape_grid
             )
             sweep_orders = jnp.asarray(sweep_orders_np)
             neighbors_minus = jnp.asarray(neighbors_minus_np)
             neighbors_plus = jnp.asarray(neighbors_plus_np)
+
+            max_sweeps: int = solver_kwargs.get("max_sweeps", 20)
+            tolerance: float = solver_kwargs.get("tolerance", 1e-8)
 
             @jax.jit
             def solve_eikonal(m_single: Float[Array, "*grid"]):
@@ -161,23 +213,28 @@ def build_travel_time_points(
                     sweep_orders=sweep_orders,
                     neighbors_minus=neighbors_minus,
                     neighbors_plus=neighbors_plus,
-                    max_sweeps=fsm_max_sweeps,
-                    tolerance=fsm_tolerance,
+                    max_sweeps=max_sweeps,
+                    tolerance=tolerance,
                 )
 
         case "nanopinv:test_solver2":
+            max_iter: int = solver_kwargs.get("max_iter", 2000)
+            tolerance: float = solver_kwargs.get("tolerance", 1e-8)
 
             @jax.jit
             def solve_eikonal(m_single: Float[Array, "*grid"]):
+
                 return ifim_multi_source(
                     phis=phis_batched,
                     speed=m_single,
                     dr=dr,
-                    max_iter=jacobi_max_iter,
-                    tolerance=fsm_tolerance,
+                    max_iter=max_iter,
+                    tolerance=tolerance,
                 )
 
         case "nanopinv:test_solver3":
+            max_sweeps: int = solver_kwargs.get("max_sweeps", 20)
+            tolerance: float = solver_kwargs.get("tolerance", 1e-8)
 
             @jax.jit
             def solve_eikonal(m_single: Float[Array, "*grid"]):
@@ -185,11 +242,13 @@ def build_travel_time_points(
                     phis=phis_batched,
                     speed=m_single,
                     dr=dr,
-                    max_sweeps=fsm_max_sweeps,
-                    tolerance=fsm_tolerance,
+                    max_sweeps=max_sweeps,
+                    tolerance=tolerance,
                 )
 
         case "nanopinv:test_solver4":
+            max_sweeps: int = solver_kwargs.get("max_sweeps", 20)
+
             if len(shape_grid) != 2:
                 raise ValueError(
                     "Solver 'nanopinv:test_solver4' is strictly implemented for 2D grids."
@@ -205,7 +264,7 @@ def build_travel_time_points(
                     phis=phis_batched,
                     speed=m_single,
                     dr=dr,
-                    iterations=fsm_max_sweeps,
+                    iterations=max_sweeps,
                 )
 
         case _:
