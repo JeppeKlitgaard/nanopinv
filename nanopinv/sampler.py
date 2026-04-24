@@ -163,7 +163,12 @@ class History(eqx.Module):
 
     def get_shapes(self) -> tuple[list[int], int, int]:
         """Returns the shapes of the batch dimensions, n_chains, and n_saved."""
-        *batch_shape, n_chains, n_saved = self.states.log_likelihood.shape
+        shape = self.states.log_likelihood.shape
+        if len(shape) == 1:
+            # Non-batched single-chain EMC histories can be saved as (n_saved,)
+            return [], 1, shape[0]
+
+        *batch_shape, n_chains, n_saved = shape
         return batch_shape, n_chains, n_saved
 
     def get_flat_shape(self) -> tuple[int, int]:
@@ -173,8 +178,9 @@ class History(eqx.Module):
         return n_chains_flat, n_saved
 
     def _get_iterations(self) -> Int[Array, "n_saved"]:
-        # states.iterations is (*batch, n_chains, n_steps,) for EMC
-        # states.iterations is (n_steps,) for EMC
+        if self.iterations.ndim <= 1:
+            return self.iterations
+
         return reduce(self.iterations, "... n_saved -> n_saved", take_first)
 
     def get_flat_cold_accepted_states(self) -> Bool[Array, "n_accepted *grid"]:
@@ -186,6 +192,9 @@ class History(eqx.Module):
     def _flatten_batched_scalar(
         arr: Float[Array, "*batch n_chains n_saved"],
     ) -> Float[Array, "flat_n_chains n_saved"]:
+        if arr.ndim == 1:
+            return jnp.expand_dims(arr, axis=0)
+
         return rearrange(arr, "... n_chains n_saved -> (n_chains ...) n_saved")
 
     def _get_log_likelihoods(self) -> Float[Array, "flat_n_chains n_saved"]:
@@ -212,6 +221,8 @@ class History(eqx.Module):
         n_chains_flat = math.prod(batch_shape) * n_chains
 
         match varying, arr.shape:
+            case (False, ()):
+                return jnp.full((n_chains_flat, n_saved), arr)
             case (False, (1,)):
                 return repeat(
                     arr,
@@ -709,6 +720,10 @@ class ExtendedMetropolisChain(eqx.Module):
         progress: bool = False,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
+        if keep_interval <= 0:
+            raise ValueError(
+                f"keep_interval ({keep_interval}) must be a positive integer"
+            )
         if n % keep_interval != 0:
             raise ValueError(
                 f"n ({n}) must be a multiple of keep_interval ({keep_interval})"
@@ -717,7 +732,7 @@ class ExtendedMetropolisChain(eqx.Module):
         n_saved = n // keep_interval
 
         def inner_scan_fn(inner_carry, inner_input):
-            i_iter, _ = inner_input
+            i_iter = inner_input
             state, n_acc, _ = inner_carry
             step_key = jax.random.fold_in(key, i_iter)
 
@@ -737,7 +752,7 @@ class ExtendedMetropolisChain(eqx.Module):
             current_state, i_outer = carry
 
             inner_iter = i_outer + jnp.arange(keep_interval, dtype=jnp.int32)
-            inner_input = (inner_iter, jnp.arange(keep_interval, dtype=jnp.int32))
+            inner_input = inner_iter
             inner_carry = (current_state, jnp.int32(0), jnp.array(False))
 
             scan_inner = _resolve_scan_tqdm_fn(
@@ -765,15 +780,21 @@ class ExtendedMetropolisChain(eqx.Module):
         carry_final, history = jax.lax.scan(scan_fn, initial_carry, scan_inputs)
         final_state, _ = carry_final
 
+        saved_states = jax.tree_util.tree_map(
+            lambda x: jnp.expand_dims(x, axis=0), history[1]
+        )
+        saved_iterand_n_accepted = jnp.expand_dims(history[2], axis=0)
+        saved_states_accepted = jnp.expand_dims(history[3], axis=0)
+
         history_obj = History(
             iterations=history[0],
-            states=history[1],
-            iterand_n_accepted=history[2],
-            states_accepted=history[3],
+            states=saved_states,
+            iterand_n_accepted=saved_iterand_n_accepted,
+            states_accepted=saved_states_accepted,
             states_swap_accepted=None,
             iterand_n_swap_accepted=None,
-            betas=self.beta,
-            step_sizes=self.proposal_dist.step_size,
+            betas=jnp.atleast_1d(self.beta),
+            step_sizes=jnp.atleast_1d(self.proposal_dist.step_size),
             varying_step_sizes=False,
             varying_betas=False,
         )
@@ -795,6 +816,14 @@ class ExtendedMetropolisChain(eqx.Module):
         progress: bool = False,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
+        if keep_interval <= 0:
+            raise ValueError(
+                f"keep_interval ({keep_interval}) must be a positive integer"
+            )
+        if tune_interval <= 0:
+            raise ValueError(
+                f"tune_interval ({tune_interval}) must be a positive integer"
+            )
         if tune_interval % keep_interval != 0:
             raise ValueError(
                 f"tune_interval ({tune_interval}) must be a multiple of keep_interval ({keep_interval})"
@@ -898,19 +927,25 @@ class ExtendedMetropolisChain(eqx.Module):
             lambda x: x.reshape((n_saved,) + x.shape[2:]), history
         )
 
+        saved_states = jax.tree_util.tree_map(
+            lambda x: jnp.expand_dims(x, axis=0), flat_history[1]
+        )
+        saved_step_sizes = jnp.expand_dims(flat_history[2], axis=0)
+        saved_iterand_n_accepted = jnp.expand_dims(flat_history[3], axis=0)
+
         final_chain = eqx.tree_at(
             lambda c: c.proposal_dist.step_size, chain_template, final_step_size
         )
 
         history_obj = History(
             iterations=flat_history[0],
-            states=flat_history[1],
-            iterand_n_accepted=flat_history[3],
-            states_accepted=jnp.zeros_like(flat_history[3], dtype=jnp.bool_),
+            states=saved_states,
+            iterand_n_accepted=saved_iterand_n_accepted,
+            states_accepted=jnp.zeros_like(saved_iterand_n_accepted, dtype=jnp.bool_),
             states_swap_accepted=None,
             iterand_n_swap_accepted=None,
-            betas=final_chain.beta,
-            step_sizes=flat_history[2],
+            betas=jnp.atleast_1d(final_chain.beta),
+            step_sizes=saved_step_sizes,
             varying_step_sizes=True,
             varying_betas=False,
         )
@@ -1089,6 +1124,10 @@ class ParallelTemperingSampler(eqx.Module):
         progress: bool = False,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
+        if keep_interval <= 0:
+            raise ValueError(
+                f"keep_interval ({keep_interval}) must be a positive integer"
+            )
         if n % keep_interval != 0:
             raise ValueError(
                 f"n ({n}) must be a multiple of keep_interval ({keep_interval})"
@@ -1204,6 +1243,14 @@ class ParallelTemperingSampler(eqx.Module):
         progress: bool = False,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
+        if keep_interval <= 0:
+            raise ValueError(
+                f"keep_interval ({keep_interval}) must be a positive integer"
+            )
+        if tune_interval <= 0:
+            raise ValueError(
+                f"tune_interval ({tune_interval}) must be a positive integer"
+            )
         if tune_interval % keep_interval != 0:
             raise ValueError(
                 f"tune_interval ({tune_interval}) must be a multiple of keep_interval ({keep_interval})"
@@ -1410,6 +1457,14 @@ class ParallelTemperingSampler(eqx.Module):
         progress: bool = False,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
+        if keep_interval <= 0:
+            raise ValueError(
+                f"keep_interval ({keep_interval}) must be a positive integer"
+            )
+        if tune_interval <= 0:
+            raise ValueError(
+                f"tune_interval ({tune_interval}) must be a positive integer"
+            )
         if tune_interval % keep_interval != 0:
             raise ValueError(
                 f"tune_interval ({tune_interval}) must be a multiple of keep_interval ({keep_interval})"
