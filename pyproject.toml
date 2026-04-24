@@ -22,7 +22,7 @@ dependencies = [
     "scipy>=1.17",
 ]
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "ipykernel<7",
     "pandas>=3.0.1",
@@ -41,7 +41,7 @@ viz = [
 cpu = [
     "jax>=0.10.0",
 ]
-gpu = [
+cuda = [
     "jax[cuda13]>=0.10.0",
 ]
 
