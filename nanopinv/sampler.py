@@ -155,10 +155,18 @@ class History(eqx.Module):
     # Temperatures (betas) and step sizes
     # Either 0-d for single chain, 1-d for multiple chains, 2-d for multiple chains with tuning history
     betas: (
-        Float[Array, ""] | Float[Array, "n_chains"] | Float[Array, "n_saved n_chains"] | Float[Array, "*batch n_chains"] | Float[Array, "*batch n_chains n_saved"]
+        Float[Array, ""]
+        | Float[Array, "n_chains"]
+        | Float[Array, "n_saved n_chains"]
+        | Float[Array, "*batch n_chains"]
+        | Float[Array, "*batch n_chains n_saved"]
     )
     step_sizes: (
-        Float[Array, ""] | Float[Array, "n_chains"] | Float[Array, "n_saved n_chains"] | Float[Array, "*batch n_chains"] | Float[Array, "*batch n_chains n_saved"]
+        Float[Array, ""]
+        | Float[Array, "n_chains"]
+        | Float[Array, "n_saved n_chains"]
+        | Float[Array, "*batch n_chains"]
+        | Float[Array, "*batch n_chains n_saved"]
     )
 
     # Whether these were varied (i.e. tuned)
@@ -196,10 +204,81 @@ class History(eqx.Module):
 
         return reduce(self.iterations, "... n_saved -> n_saved", take_first)
 
-    def get_flat_cold_accepted_states(self) -> Bool[Array, "n_accepted *grid"]:
+    @eqx.filter_jit
+    def _get_cold_flat_accept_mask(
+        self,
+        min_interval: int,
+        states_accepted_cold_mask: Bool[Array, "n_chains_cold n_saved"],
+    ) -> Bool[Array, "n_chains_cold n_saved"]:
+        iterations = self._get_iterations()
+
+        # So that the first accepted state is always accepted
+        initial_carry = -jnp.asarray(min_interval).astype(iterations.dtype)
+
+        # Now we must filter out the ones that are too close
+        def should_accept(carry, inputs):
+            current_iter, current_accepted = inputs
+            last_accepted_iter = carry
+
+            interval_satisfied = (current_iter - last_accepted_iter) >= min_interval
+
+            # n=0
+            current_not_accepted = lambda _: (last_accepted_iter, False)
+            # n=1
+            current_accepted_but_too_soon = lambda _: (last_accepted_iter, False)
+            # n=2
+            current_accepted_and_far_enough = lambda _: (current_iter, True)
+
+            # Compute index n ∈ {0, 1, 2}
+            # False + False = 0 (n=0)
+            # True  + False = 1 (n=1)
+            # True  + True  = 2 (n=2)
+            n = current_accepted.astype(jnp.int32) + (
+                current_accepted & interval_satisfied
+            ).astype(jnp.int32)
+
+            branches = [
+                current_not_accepted,
+                current_accepted_but_too_soon,
+                current_accepted_and_far_enough,
+            ]
+            carry, history_entry = jax.lax.switch(n, branches, operand=None)
+
+            return carry, history_entry
+
+        @partial(jax.vmap, in_axes=(None, 0), out_axes=0)
+        def should_accept_chain(
+            iterations: Int[Array, "n_saved"], chain_accept_mask: Bool[Array, "n_saved"]
+        ):
+            inputs = (iterations, chain_accept_mask)
+            _, final_accept_mask = jax.lax.scan(should_accept, initial_carry, inputs)
+
+            return final_accept_mask
+
+        final_accept_mask = should_accept_chain(iterations, states_accepted_cold_mask)
+
+        return final_accept_mask
+
+    # Note: Outer here is not JIT-able since it has dynamic shape
+    def get_flat_cold_accepted_states(
+        self, min_interval: int
+    ) -> Bool[Array, "n_accepted *grid"]:
+        """
+        Fetches states from each cold chain (`beta==1.0`)
+        such that the accepted states are at least `min_interval` apart in the iteration history.
+
+        Set `min_interval` around your correlation time to get approximately independent samples from the cold posterior.
+        """
         cold_mask = self.betas == 1.0
-        states_accepted_cold = self.states_accepted[cold_mask]
-        return self.states.state[cold_mask][states_accepted_cold]
+        states_accepted_cold_mask = self.states_accepted[cold_mask]
+        # ^ Shape: (n_chains_cold, n_saved)
+
+        final_accept_mask = self._get_cold_flat_accept_mask(
+            min_interval=min_interval,
+            states_accepted_cold_mask=states_accepted_cold_mask,
+        )
+        final_states = self.states.state[cold_mask][final_accept_mask]
+        return final_states
 
     @staticmethod
     def _flatten_batched_scalar(
@@ -438,7 +517,11 @@ class History(eqx.Module):
 
         if n_chains_flat > 1:
             ax.plot(
-                lags_steps, acf_logL.mean(axis=0), color="black", lw=2.6, label="Average ACF"
+                lags_steps,
+                acf_logL.mean(axis=0),
+                color="black",
+                lw=2.6,
+                label="Average ACF",
             )
 
         ax.axhline(0.0, color="gray", lw=1.0)
@@ -654,7 +737,6 @@ class History(eqx.Module):
         fig.suptitle(title, fontsize=16, y=1.02)
         plt.show()
         return fig, axes
-
 
 
 class ExtendedMetropolisChain(eqx.Module):
