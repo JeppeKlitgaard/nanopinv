@@ -5,19 +5,15 @@ description = "Tiny, educational implementation of probabilistic inversion in ge
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "beartype>=0.22.9",
-    "einops>=0.8.2",
+    "beartype>=0.22.9,<0.23",
+    "einops>=0.8.2,<0.9",
     "equinox>=0.13.6",
-    "gstools>=1.7.0",
+    "gstools>=1.7.0,<2",
     "jax>=0.9.2",
     "jaxtyping>=0.3.9",
     "joblib>=1.5.3",
-    "line-profiler>=5.0.2",
-    "numba>=0.64.0",
-    "numexpr>=2.14.1",
-    "numpy>=2",
-    "penzai>=0.2.5",
-    "polars>=1.39.3",
+    "numpy>=2,<3",
+    "polars>=1.39.3,<2",
     "scikit-fmm>=2025.6.23",
     "scipy>=1.17",
 ]
