@@ -12,10 +12,7 @@ from jax import lax
 from jax import numpy as jnp
 
 from nanopinv._typing import Array, Float
-from nanopinv.physics.eikonal.nanopinv_fsm import (
-    _get_axis_min_times,
-    _vectorized_godunov_jax,
-)
+from nanopinv.physics.eikonal._common import get_axis_min_times, vectorized_godunov
 
 
 def _dilate_mask(mask, ndim):
@@ -54,8 +51,8 @@ def ifim_single_source(
 
     def update_step(state):
         T, source, active, active_empty = state
-        axis_min_times = _get_axis_min_times(T, ndim)
-        T_cand = _vectorized_godunov_jax(axis_min_times, spacing_sq_inv, inv_speed, dr)
+        axis_min_times = get_axis_min_times(T, ndim)
+        T_cand = vectorized_godunov(axis_min_times, spacing_sq_inv, inv_speed, dr)
 
         converged = active & (jnp.abs(T_cand - T) <= tol_j)
         new_source = source | converged
@@ -74,14 +71,14 @@ def ifim_single_source(
         0, max_iter, update_cond_body, state
     )
 
-    axis_min_times = _get_axis_min_times(T_after_update, ndim)
-    T_cand_rem = _vectorized_godunov_jax(axis_min_times, spacing_sq_inv, inv_speed, dr)
+    axis_min_times = get_axis_min_times(T_after_update, ndim)
+    T_cand_rem = vectorized_godunov(axis_min_times, spacing_sq_inv, inv_speed, dr)
     remedy_mask = (jnp.abs(T_cand_rem - T_after_update) > tol_j) & ~final_source
 
     def remedy_step(state):
         T, remedy, remedy_empty = state
-        axis_min_times = _get_axis_min_times(T, ndim)
-        T_cand = _vectorized_godunov_jax(axis_min_times, spacing_sq_inv, inv_speed, dr)
+        axis_min_times = get_axis_min_times(T, ndim)
+        T_cand = vectorized_godunov(axis_min_times, spacing_sq_inv, inv_speed, dr)
 
         improved = remedy & (T_cand < T - tol_j)
         T_new = jnp.where(improved, T_cand, T)

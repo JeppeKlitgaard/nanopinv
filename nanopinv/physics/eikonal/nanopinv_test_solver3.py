@@ -5,9 +5,9 @@ from jax import lax
 from jax import numpy as jnp
 
 from nanopinv._typing import Array, Float
-from nanopinv.physics.eikonal.nanopinv_fsm import (
-    _get_axis_min_times,
-    _vectorized_godunov_jax,
+from nanopinv.physics.eikonal._common import (
+    get_axis_min_times,
+    vectorized_godunov,
 )
 
 
@@ -54,8 +54,8 @@ def hyperplane_fsm_single_source(
 
         def step(T_carry, k):
             mask = sum_indices == k
-            axis_mins = _get_axis_min_times(T_carry, ndim)
-            T_cand = _vectorized_godunov_jax(axis_mins, spacing_sq_inv, F_f, dr)
+            axis_mins = get_axis_min_times(T_carry, ndim)
+            T_cand = vectorized_godunov(axis_mins, spacing_sq_inv, F_f, dr)
             T_new = jnp.where(mask, jnp.minimum(T_carry, T_cand), T_carry)
             T_new = jnp.where(fix_f, 0.0, T_new)
             return T_new, None

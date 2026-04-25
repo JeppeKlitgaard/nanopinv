@@ -157,6 +157,7 @@ def build_travel_time_points(
 
     match solver:
         case "nanopinv:fsm":
+            order: int = solver_kwargs.get("order", 2)
             max_iter: int = solver_kwargs.get("max_iter", 2000)
             tolerance: float = solver_kwargs.get("tolerance", 1e-8)
 
@@ -167,6 +168,7 @@ def build_travel_time_points(
                     distances=distances_batched,
                     speed=m_single,
                     dr=dr,
+                    order=order,
                     max_iter=max_iter,
                     tolerance=tolerance,
                     debug=debug,
