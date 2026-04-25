@@ -492,14 +492,17 @@ class History(eqx.Module):
         steps = self._get_iterations()
         keep_interval = int(steps[1] - steps[0]) if len(steps) > 1 else 1
 
-        max_lag = min(max_lag, n_saved - 1)
-        lags_idx = np.arange(max_lag + 1)
+        # max_lag is specified in MCMC-step units; convert to saved-sample lag index.
+        max_lag_idx = max_lag // keep_interval
+        max_lag_idx = min(max_lag_idx, n_saved - 1)
+
+        lags_idx = np.arange(max_lag_idx + 1)
         lags_steps = lags_idx * keep_interval
 
         # Compute ACF via statsmodels
         acf_logL = np.array(
             [
-                acf(log_likelihoods[i], nlags=max_lag, fft=True)
+                acf(log_likelihoods[i], nlags=max_lag_idx, fft=True)
                 for i in range(n_chains_flat)
             ]
         )
