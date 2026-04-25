@@ -1,3 +1,11 @@
+"""
+Different MCMC samplers
+
+Overview of arguments:
+- unroll_inner: How many steps to unroll in the inner scan loop.
+    Higher means more compilation time, but potentially faster execution (especially for fast forward models?)
+"""
+
 import math
 from collections.abc import Callable
 from functools import partial
@@ -54,6 +62,8 @@ def _scan_with_optional_progress(
     init_carry: Any,
     scan_inputs: Any,
     *,
+    length: int,
+    unroll: int | bool,
     progress: bool,
 ):
     if progress:
@@ -61,7 +71,10 @@ def _scan_with_optional_progress(
         final_pbar, history = jax.lax.scan(scan_fn, wrapped_init, scan_inputs)
         return final_pbar.carry, history
 
-    return jax.lax.scan(scan_fn, init_carry, scan_inputs)
+    if isinstance(unroll, int) and unroll >= length:
+        unroll = True
+
+    return jax.lax.scan(scan_fn, init_carry, scan_inputs, unroll=unroll)
 
 
 class ProposalDistribution(eqx.Module):
@@ -716,7 +729,9 @@ class ExtendedMetropolisChain(eqx.Module):
         iter_state: IterationState,
         observations: ObservationsT,
         step_size: Float[Array, ""] | None = None,
+        # Static
         keep_interval: int = 1,
+        inner_unroll: int | bool = 10,
         progress: bool = False,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
@@ -767,6 +782,8 @@ class ExtendedMetropolisChain(eqx.Module):
                 inner_carry,
                 inner_input,
                 progress=progress,
+                length=keep_interval,
+                unroll=inner_unroll,
             )
 
             i_next_outer = i_outer + keep_interval
@@ -812,7 +829,9 @@ class ExtendedMetropolisChain(eqx.Module):
         target_acceptance_rate: float = 0.25,
         learning_rate: float = 1.0,
         learning_rate_decay: float = 0.5,
+        # Static
         keep_interval: int = 1,
+        inner_unroll: int | bool = 10,
         progress: bool = False,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
@@ -889,6 +908,8 @@ class ExtendedMetropolisChain(eqx.Module):
                     inner_init,
                     inner_inputs,
                     progress=progress,
+                    length=keep_interval,
+                    unroll=inner_unroll,
                 )
 
                 next_total_acc = total_acc + chunk_acc
@@ -1122,6 +1143,7 @@ class ParallelTemperingSampler(eqx.Module):
         observations: ObservationsT,
         keep_interval: int = 1,
         progress: bool = False,
+        inner_unroll: int | bool = 10,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
         if keep_interval <= 0:
@@ -1184,6 +1206,8 @@ class ParallelTemperingSampler(eqx.Module):
                     inner_init,
                     inner_inputs,
                     progress=progress,
+                    length=keep_interval,
+                    unroll=inner_unroll,
                 )
             )
 
@@ -1241,6 +1265,7 @@ class ParallelTemperingSampler(eqx.Module):
         learning_rate_beta_decay: float = 0.5,
         keep_interval: int = 1,
         progress: bool = False,
+        inner_unroll: int | bool = 10,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
         if keep_interval <= 0:
@@ -1333,6 +1358,8 @@ class ParallelTemperingSampler(eqx.Module):
                         inner_init,
                         inner_inputs,
                         progress=progress,
+                        length=keep_interval,
+                        unroll=inner_unroll,
                     )
                 )
 
@@ -1455,6 +1482,7 @@ class ParallelTemperingSampler(eqx.Module):
         learning_rate_decay: float,
         keep_interval: int = 1,
         progress: bool = False,
+        inner_unroll: int | bool = 10,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
         if keep_interval <= 0:
@@ -1542,6 +1570,8 @@ class ParallelTemperingSampler(eqx.Module):
                         inner_init,
                         inner_inputs,
                         progress=progress,
+                        length=keep_interval,
+                        unroll=inner_unroll,
                     )
                 )
 
@@ -1716,6 +1746,7 @@ class ParallelTemperingSampler(eqx.Module):
         keep_interval: int = 1,
         method: Literal["robbins_monro"] | EllipsisType = ...,
         progress: bool = False,
+        inner_unroll: int | bool = 10,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
         sampler = self
@@ -1740,6 +1771,7 @@ class ParallelTemperingSampler(eqx.Module):
             learning_rate_decay=learning_rate_decay,
             keep_interval=keep_interval,
             progress=progress,
+            inner_unroll=inner_unroll,
             jax_tqdm_kwargs=jax_tqdm_kwargs,
         )
 
@@ -1758,6 +1790,7 @@ class ParallelTemperingSampler(eqx.Module):
         keep_interval: int = 1,
         method: Literal["robbins_monro", "czyz"] | EllipsisType = ...,
         progress: bool = False,
+        inner_unroll: int | bool = 10,
         jax_tqdm_kwargs: dict[str, Any] | None = None,
     ):
         sampler = self
@@ -1788,5 +1821,6 @@ class ParallelTemperingSampler(eqx.Module):
             learning_rate_decay=learning_rate_decay,
             keep_interval=keep_interval,
             progress=progress,
+            inner_unroll=inner_unroll,
             jax_tqdm_kwargs=jax_tqdm_kwargs,
         )
