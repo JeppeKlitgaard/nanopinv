@@ -9,7 +9,6 @@ dependencies = [
     "einops>=0.8.2,<0.9",
     "equinox>=0.13.6",
     "gstools>=1.7.0,<2",
-    "jax>=0.9.2",
     "jaxtyping>=0.3.9",
     "joblib>=1.5.3",
     "numpy>=2,<3",
