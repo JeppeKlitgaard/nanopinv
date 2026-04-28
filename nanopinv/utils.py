@@ -71,11 +71,11 @@ def make_pytree_spec(pytree, spec: dict):
     def map_fn(path, leaf):
         path_str = path_to_string(path)
 
-        # 1. Check for an Exact Match
+        # Check for an Exact Match
         if path_str in spec:
             return spec[path_str]
 
-        # 2. Check for Sub-spec matches (composing nested PyTrees/Dicts)
+        # Check for Sub-spec matches (composing nested PyTrees/Dicts)
         # We check valid structural path prefixes from longest to shortest
         for i in range(len(path) - 1, 0, -1):
             prefix_str = path_to_string(path[:i])
@@ -131,7 +131,7 @@ def make_pytree_spec(pytree, spec: dict):
 
                 return res
 
-        # 3. Check for Explicit Prefix Wildcards
+        # Check for Explicit Prefix Wildcards
         best_match_len = -1
         best_val = None
 
@@ -152,7 +152,7 @@ def make_pytree_spec(pytree, spec: dict):
         if best_match_len != -1:
             return best_val
 
-        # 4. Check for Global Wildcard
+        # Check for Global Wildcard
         if "*" in spec:
             return spec["*"]
 

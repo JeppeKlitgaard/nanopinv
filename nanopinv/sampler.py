@@ -100,6 +100,7 @@ class ProposalDistribution(eqx.Module):
         if step_size is None:
             step_size = self.step_size
 
+        # Pre-conditioned Crank-Nicolson
         new_realisation = self.dist(key)
         state_proposal = (
             self.mean
