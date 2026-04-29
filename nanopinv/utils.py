@@ -1,8 +1,7 @@
+import math
 from dataclasses import dataclass
 
-import equinox as eqx
 import jax
-import jax.numpy as jnp
 import jaxtyping
 from jax.tree_util import DictKey, GetAttrKey, SequenceKey, tree_map_with_path
 
@@ -25,21 +24,31 @@ class StatefulRNGKey:
 
         self.key = key
 
-    def shaped(self, shape: tuple[int, ...]):
-        num_new_keys = jnp.prod(jnp.array(shape)) + 1
-        new_keys = jax.random.split(self.key, num=num_new_keys)
+    def _get_new_key(self, seed: int | None = None):
+        if seed is not None:
+            return jax.random.key(seed)
 
-        self.key = new_keys[0]
-        return new_keys[1:].reshape((*shape, *new_keys.shape[1:]))
+        self.key, subkey = jax.random.split(self.key)
+        return subkey
 
-    def __call__(self, n: int | None = None):
+    def shaped(self, shape: tuple[int, ...], seed: int | None = None):
+        gen_key = self._get_new_key(seed)
+
+        num_keys_out = math.prod(shape)
+        new_keys = jax.random.split(gen_key, num=num_keys_out)
+
+        return new_keys.reshape(shape)
+
+    def __call__(self, n: int | None = None, seed: int | None = None):
+        gen_key = self._get_new_key(seed)
+
+        num = 1 if n is None else n
+        new_keys = jax.random.split(gen_key, num=num)
+
         if n is None:
-            self.key, subkey = jax.random.split(self.key)
-            return subkey
+            return new_keys[0]
 
-        new_keys = jax.random.split(self.key, num=n + 1)
-        self.key = new_keys[0]
-        return new_keys[1:]
+        return new_keys
 
 
 def make_pytree_spec(pytree, spec: dict):
