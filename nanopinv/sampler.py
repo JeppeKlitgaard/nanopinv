@@ -20,6 +20,7 @@ import numpy as np
 from einops import rearrange, reduce, repeat
 from jax_tqdm import PBar, scan_tqdm
 from statsmodels.tsa.stattools import acf
+import cmcrameri.cm as cmc
 
 from nanopinv._typing import Array, Bool, Float, Int, Key, Shaped
 from nanopinv.distribution import DistributionBase
@@ -135,6 +136,14 @@ def take_first(tensor, axis):
     return tensor
 
 
+_HISTORY_PLOT_DEFAULTS = {
+    "cmap": cmc.batlow,
+    "average": {"lw": 1.2, "color": "black", "label": "Average"},
+    "chain": {"lw": 0.8, "alpha": 0.75},
+    "target": {"lw": 1.4, "color": "tab:red", "ls": "--", "alpha": 0.9},
+}
+
+
 class History(eqx.Module):
     # Iteration numbers for n_saved axis
     iterations: Int[Array, "*batch n_saved"]
@@ -198,6 +207,160 @@ class History(eqx.Module):
         batch_shape, n_chains, n_saved = self.get_shapes()
         n_chains_flat = math.prod(batch_shape) * n_chains
         return n_chains_flat, n_saved
+
+    def append(self, other: History) -> History:
+        """Return a new history with `other` appended after `self`.
+
+        The histories must describe the same batch and chain layout. Iteration numbers
+        from `other` are shifted so they continue from the final iteration in `self`.
+        When swap statistics are only available for one side, the missing section is
+        padded with NaNs so the combined history keeps the full timeline.
+        """
+
+        self_batch_shape, self_n_chains, _ = self.get_shapes()
+        other_batch_shape, other_n_chains, _ = other.get_shapes()
+
+        if (self_batch_shape, self_n_chains) != (other_batch_shape, other_n_chains):
+            raise ValueError(
+                "Histories must have the same batch shape and number of chains to be appended."
+            )
+
+        state_saved_axis = 0 if self.states.log_likelihood.ndim == 1 else len(self_batch_shape) + 1
+
+        def _shape_without_axis(shape: tuple[int, ...], axis: int) -> tuple[int, ...]:
+            return shape[:axis] + shape[axis + 1 :]
+
+        self_state_leaves = jax.tree_util.tree_leaves(self.states)
+        other_state_leaves = jax.tree_util.tree_leaves(other.states)
+
+        if len(self_state_leaves) != len(other_state_leaves):
+            raise ValueError("Histories must have the same state tree structure.")
+
+        for left_leaf, right_leaf in zip(self_state_leaves, other_state_leaves, strict=True):
+            if _shape_without_axis(left_leaf.shape, state_saved_axis) != _shape_without_axis(
+                right_leaf.shape, state_saved_axis
+            ):
+                raise ValueError("Underlying chain shapes must match before appending histories.")
+
+        iterations = jnp.concatenate(
+            [self.iterations, other.iterations + self.iterations[..., -1:]], axis=-1
+        )
+
+        states = jax.tree_util.tree_map(
+            lambda left, right: jnp.concatenate([left, right], axis=state_saved_axis),
+            self.states,
+            other.states,
+        )
+
+        iterand_n_accepted = jnp.concatenate(
+            [self.iterand_n_accepted, other.iterand_n_accepted], axis=-1
+        )
+        states_accepted = jnp.concatenate(
+            [self.states_accepted, other.states_accepted], axis=-1
+        )
+
+        def _expand_hyperparameter(arr, varying, n_saved):
+            if varying:
+                return arr
+
+            if arr.ndim == 0:
+                return jnp.broadcast_to(arr, (n_saved,))
+
+            if arr.ndim == 1:
+                if arr.shape[0] == 1:
+                    return jnp.broadcast_to(arr, (n_saved,))
+                if arr.shape[0] == self_n_chains:
+                    return jnp.broadcast_to(arr[:, None], (self_n_chains, n_saved))
+
+            if arr.ndim == len(self_batch_shape) + 1 and arr.shape[:-1] == tuple(self_batch_shape):
+                return jnp.broadcast_to(arr[..., None], tuple(self_batch_shape) + (self_n_chains, n_saved))
+
+            raise ValueError(f"Invalid fixed hyperparameter shape: {arr.shape}")
+
+        self_step_sizes_expanded = _expand_hyperparameter(
+            self.step_sizes, self.varying_step_sizes, self.n_saved
+        )
+        other_step_sizes_expanded = _expand_hyperparameter(
+            other.step_sizes, other.varying_step_sizes, other.n_saved
+        )
+        self_betas_expanded = _expand_hyperparameter(self.betas, self.varying_betas, self.n_saved)
+        other_betas_expanded = _expand_hyperparameter(other.betas, other.varying_betas, other.n_saved)
+
+        step_sizes_varying = self.varying_step_sizes or other.varying_step_sizes or not jnp.array_equal(
+            self_step_sizes_expanded[..., 0], other_step_sizes_expanded[..., 0]
+        )
+        betas_varying = self.varying_betas or other.varying_betas or not jnp.array_equal(
+            self_betas_expanded[..., 0], other_betas_expanded[..., 0]
+        )
+
+        if step_sizes_varying:
+            step_sizes = jnp.concatenate([self_step_sizes_expanded, other_step_sizes_expanded], axis=-1)
+        else:
+            step_sizes = self.step_sizes
+
+        if betas_varying:
+            betas = jnp.concatenate([self_betas_expanded, other_betas_expanded], axis=-1)
+        else:
+            betas = self.betas
+
+        def _combine_swap_history(
+            left_states: Bool[Array, "*batch n_saved n_chains-1"] | None,
+            left_counts: Int[Array, "*batch n_saved n_chains-1"] | None,
+            right_states: Bool[Array, "*batch n_saved n_chains-1"] | None,
+            right_counts: Int[Array, "*batch n_saved n_chains-1"] | None,
+        ):
+            if left_counts is None and right_counts is None:
+                return None, None
+
+            if left_counts is None:
+                assert right_counts is not None
+                assert right_states is not None
+                swap_dtype = jnp.result_type(right_counts, jnp.float32)
+                left_counts_arr = jnp.full(right_counts.shape, jnp.nan, dtype=swap_dtype)
+                right_counts_arr = right_counts.astype(swap_dtype)
+                left_states_arr = jnp.zeros_like(right_states, dtype=jnp.bool_)
+                combined_states = jnp.concatenate([left_states_arr, right_states], axis=-1)
+                combined_counts = jnp.concatenate([left_counts_arr, right_counts_arr], axis=-1)
+                return combined_states, combined_counts
+            elif right_counts is None:
+                assert left_counts is not None
+                assert left_states is not None
+                swap_dtype = jnp.result_type(left_counts, jnp.float32)
+                right_counts_arr = jnp.full(left_counts.shape, jnp.nan, dtype=swap_dtype)
+                left_counts_arr = left_counts.astype(swap_dtype)
+                right_states_arr = jnp.zeros_like(left_states, dtype=jnp.bool_)
+                combined_states = jnp.concatenate([left_states, right_states_arr], axis=-1)
+                combined_counts = jnp.concatenate([left_counts_arr, right_counts_arr], axis=-1)
+                return combined_states, combined_counts
+
+            assert left_states is not None
+            assert right_states is not None
+            assert left_counts is not None
+            assert right_counts is not None
+
+            combined_states = jnp.concatenate([left_states, right_states], axis=-1)
+            combined_counts = jnp.concatenate([left_counts, right_counts], axis=-1)
+            return combined_states, combined_counts
+
+        states_swap_accepted, iterand_n_swap_accepted = _combine_swap_history(
+            self.states_swap_accepted,
+            self.iterand_n_swap_accepted,
+            other.states_swap_accepted,
+            other.iterand_n_swap_accepted,
+        )
+
+        return History(
+            iterations=iterations,
+            states=states,
+            states_accepted=states_accepted,
+            iterand_n_accepted=iterand_n_accepted,
+            states_swap_accepted=states_swap_accepted,
+            iterand_n_swap_accepted=iterand_n_swap_accepted,
+            betas=betas,
+            step_sizes=step_sizes,
+            varying_step_sizes=step_sizes_varying,
+            varying_betas=betas_varying,
+        )
 
     def _get_iterations(self) -> Int[Array, "n_saved"]:
         if self.iterations.ndim <= 1:
@@ -360,7 +523,7 @@ class History(eqx.Module):
     def _get_colors_and_labels(self):
         n = self.n_chains_flat
         betas = self._get_betas()
-        colors = plt.cm.viridis(np.linspace(0.1, 0.9, max(n, 2)))[:n]
+        colors = _HISTORY_PLOT_DEFAULTS["cmap"](np.linspace(0.1, 0.9, max(n, 2)))[:n]
         stride = max(1, n // 10)
 
         def c_label(i):
@@ -380,17 +543,19 @@ class History(eqx.Module):
         *,
         colors,
         labels,
-        lw: float,
-        alpha: float,
+        **kwargs,
     ):
         """Plots one line per chain with consistent fallback styling."""
         n_chains_flat = y.shape[0]
         for i in range(n_chains_flat):
             color = colors[i] if i < len(colors) else "black"
             label = labels[i] if i < len(labels) else f"Chain {i}"
-            ax.plot(x, y[i], color=color, lw=lw, alpha=alpha, label=label)
+            args = _HISTORY_PLOT_DEFAULTS["chain"] | {"color": color, "label": label} | kwargs
+            ax.plot(
+                x, y[i], **args
+            )
 
-    def plot_step_sizes(self, ax=None, **kwargs):
+    def plot_step_sizes(self, ax=None, plot_chain_kwargs: dict[str, Any] | None = None, **kwargs):
         """
         Plots the step size trajectories across MCMC iterations.
         If step sizes are fixed, these will appear as horizontal lines.
@@ -408,8 +573,7 @@ class History(eqx.Module):
             step_sizes,
             colors=colors,
             labels=labels,
-            lw=1.5,
-            alpha=0.9,
+            **(plot_chain_kwargs or {}),
         )
 
         # Update title based on whether tuning occurred
@@ -439,14 +603,13 @@ class History(eqx.Module):
             betas,
             colors=colors,
             labels=labels,
-            lw=1.5,
-            alpha=0.9,
         )
 
         title = "Tuning: Betas" if self.varying_betas else "Fixed Betas"
         ax.set_title(title)
         ax.set_xlabel("MCMC Step")
         ax.set_ylabel("Beta")
+        ax.set_yscale("log")
         ax.legend(fontsize=8, ncol=kwargs.get("legend_ncol", 2), frameon=True)
 
         return ax
@@ -470,16 +633,14 @@ class History(eqx.Module):
             log_likelihoods,
             colors=colors,
             labels=labels,
-            lw=1.3,
-            alpha=0.85,
         )
 
         if n_chains_flat > 1:
-            ax.plot(steps, mean_log_likelihoods, color="black", lw=2.6, label="Average")
+            ax.plot(steps, mean_log_likelihoods, color="black", lw=1.2, label="Average")
 
         ax.set_title("Log-Likelihood Trace")
         ax.set_xlabel("MCMC Step")
-        ax.set_ylabel("Log-likelihood")
+        ax.set_ylabel("Log Likelihood, $\\log{L}$")
         ax.legend(fontsize=8, frameon=True)
         return ax
 
@@ -515,17 +676,13 @@ class History(eqx.Module):
             acf_logL,
             colors=colors,
             labels=labels,
-            lw=1.2,
-            alpha=0.85,
         )
 
         if n_chains_flat > 1:
             ax.plot(
                 lags_steps,
                 acf_logL.mean(axis=0),
-                color="black",
-                lw=2.6,
-                label="Average ACF",
+                **_HISTORY_PLOT_DEFAULTS["average"],
             )
 
         ax.axhline(0.0, color="gray", lw=1.0)
@@ -537,7 +694,13 @@ class History(eqx.Module):
         return ax
 
     def plot_local_acceptance(
-        self, ax=None, window: int = 75, target: float = 0.25, **kwargs
+        self,
+        ax=None,
+        window: int = 75,
+        target: float = 0.25,
+        plot_average_kwargs: dict[str, Any] | None = None,
+        plot_chain_kwargs: dict[str, Any] | None = None,
+        **kwargs,
     ):
         if ax is None:
             _, ax = plt.subplots(figsize=kwargs.get("figsize", (8, 5)))
@@ -574,26 +737,20 @@ class History(eqx.Module):
             roll_rates,
             colors=colors,
             labels=labels,
-            lw=1.2,
-            alpha=0.9,
+            **(plot_chain_kwargs or {}),
         )
 
         if n_chains_flat > 1:
             ax.plot(
                 roll_steps,
                 np.mean(roll_rates, axis=0),
-                color="black",
-                lw=2.6,
-                label="Average",
+                **(_HISTORY_PLOT_DEFAULTS["average"] | (plot_average_kwargs or {})),
             )
 
         ax.axhline(
             target,
-            color="crimson",
-            ls="--",
-            lw=1.4,
-            alpha=0.9,
             label=f"Target {target:.2f}",
+            **_HISTORY_PLOT_DEFAULTS["target"],
         )
         ax.set_title(f"Within-Chain Acceptance (Window={window} steps)")
         ax.set_xlabel("MCMC Step")
@@ -658,27 +815,28 @@ class History(eqx.Module):
             roll_rates,
             colors=colors,
             labels=labels,
-            lw=1.2,
-            alpha=0.9,
         )
 
         if n_chains_flat > 1:
+            valid_counts = np.sum(~np.isnan(roll_rates), axis=0)
+            summed_rates = np.nansum(roll_rates, axis=0)
+            mean_rates = np.divide(
+                summed_rates,
+                valid_counts,
+                out=np.full_like(summed_rates, np.nan, dtype=float),
+                where=valid_counts != 0,
+            )
             ax.plot(
                 roll_steps,
-                np.mean(roll_rates, axis=0),
-                color="black",
-                lw=2.6,
-                label="Average",
+                mean_rates,
+                **_HISTORY_PLOT_DEFAULTS["average"],
             )
 
         if target is not None:
             ax.axhline(
                 target,
-                color="crimson",
-                ls="--",
-                lw=1.4,
-                alpha=0.9,
                 label=f"Target {target:.2f}",
+                **_HISTORY_PLOT_DEFAULTS["target"],
             )
 
         ax.set_title(f"Inter-Chain Acceptance (Window={window} steps)")
@@ -1150,6 +1308,7 @@ class ParallelTemperingSampler(eqx.Module):
         swap_acceptances: Float[Array, "n_chains-1"],
         learning_rate: float,
     ) -> Float[Array, "n_chains"]:
+        # Note: This tuning keeps the endpoints of β fixed.
         if betas.shape[0] <= 1:
             return betas
 
@@ -1260,7 +1419,16 @@ class ParallelTemperingSampler(eqx.Module):
             next_sw_n_acc = sw_n_acc + swap_acc.astype(jnp.int32)
             next_loc_n_acc = loc_n_acc + local_acc.astype(jnp.int32)
 
-            next_carry = (next_st, next_sw_n_acc, next_loc_n_acc, swap_acc, local_acc)
+            # In order to decide which states are acceptable as potential samples
+            # of the posterior, we only need to ensure that the state has been changed
+            # either through swapping or accepting the local proposal
+            # Even if the state has just been swapped from a hot neighbour
+            # it is still valid due to the detailed balance of the swap move.
+            swapped_left = jnp.concatenate([swap_acc, jnp.array([False])])
+            swapped_right = jnp.concatenate([jnp.array([False]), swap_acc])
+            accept_last = local_acc | swapped_left | swapped_right
+
+            next_carry = (next_st, next_sw_n_acc, next_loc_n_acc, swap_acc, accept_last)
             return next_carry, None
 
         inner_scan = _resolve_scan_tqdm_fn(
@@ -1286,7 +1454,7 @@ class ParallelTemperingSampler(eqx.Module):
                 keep_interval, dtype=jnp.int32
             )
 
-            (final_states, total_sw_acc, total_loc_acc, sw_last, loc_last), _ = (
+            (final_states, total_sw_acc, total_loc_acc, sw_last, accept_last), _ = (
                 _scan_with_optional_progress(
                     inner_scan,
                     inner_init,
@@ -1304,7 +1472,7 @@ class ParallelTemperingSampler(eqx.Module):
                 total_sw_acc,
                 total_loc_acc,
                 sw_last,
-                loc_last,
+                accept_last,
             )
 
             return final_states, history_entry
