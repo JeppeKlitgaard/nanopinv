@@ -12,10 +12,13 @@ __NEW_KEY_DTYPE = jax.random.key(0).dtype
 class StatefulRNGKey:
     key: jaxtyping.Key
 
-    def __init__(self, key: jaxtyping.Key | int):
+    def __init__(self, key: jaxtyping.Key | int | str):
         """
         Note: Key should be new style (made with `jax.random.key`, not `jax.random.PRNGKey`)
         """
+        if isinstance(key, str):
+            key = hash(key)  # Now its an int
+
         if isinstance(key, int):
             key = jax.random.key(key)
 
@@ -24,14 +27,20 @@ class StatefulRNGKey:
 
         self.key = key
 
-    def _get_new_key(self, seed: int | None = None):
-        if seed is not None:
+    def _get_new_key(self, seed: int | str | None = None):
+        if isinstance(seed, str):
+            seed = hash(seed)  # Now its an int
+
+        if isinstance(seed, int):
             return jax.random.key(seed)
+
+        if seed is not None:
+            raise ValueError(f"Seed must be an int, str, or None. Got {type(seed)}")
 
         self.key, subkey = jax.random.split(self.key)
         return subkey
 
-    def shaped(self, shape: tuple[int, ...], seed: int | None = None):
+    def shaped(self, shape: tuple[int, ...], seed: int | str | str | None = None):
         gen_key = self._get_new_key(seed)
 
         num_keys_out = math.prod(shape)
@@ -39,7 +48,7 @@ class StatefulRNGKey:
 
         return new_keys.reshape(shape)
 
-    def __call__(self, n: int | None = None, seed: int | None = None):
+    def __call__(self, n: int | None = None, seed: int | str | None = None):
         gen_key = self._get_new_key(seed)
 
         num = 1 if n is None else n
